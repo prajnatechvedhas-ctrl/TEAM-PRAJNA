@@ -53,3 +53,4 @@ In version 2, the 16-byte record header is expanded to 24 bytes by introducing a
 ### 2.5 Interaction with the Independent Oracle
 - Testing TTL with chaos crashes is notoriously difficult because kills happen asynchronously.
 - The oracle model must maintain `(val, expire_at_ms)`. When verifying `get(k)` or `dump()`, the oracle must query using the exact timestamp of the request, accounting for millisecond jitter between child process execution and oracle verification.
+
