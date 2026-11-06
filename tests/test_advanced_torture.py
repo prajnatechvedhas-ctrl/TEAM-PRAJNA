@@ -29,6 +29,10 @@ import unittest
 import zlib
 from typing import Dict, List, Optional, Set, Tuple
 
+SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
 from vedasbase import (
     open as vedas_open,
     VedasDB,
@@ -342,14 +346,14 @@ class TestAdvancedTorture(unittest.TestCase):
             oracle = AdvancedOracle()
 
             # Start child process in serve mode
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            kvdb_py = os.path.join(repo_root, "kvdb.py")
             cmd = [
                 PYTHON_EXE,
                 "-u",
-                "-m",
-                "vedasbase",
-                "--db",
-                db_path,
+                kvdb_py,
                 "serve",
+                db_path,
                 "--workers",
                 "2",
             ]

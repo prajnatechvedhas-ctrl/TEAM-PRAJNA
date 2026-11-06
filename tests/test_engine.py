@@ -3,9 +3,15 @@ Unit tests for Vedas Base storage engine core.
 """
 
 import os
+import sys
 import unittest
 import struct
 import zlib
+
+SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
 from vedasbase import (
     open as vedas_open,
     VedasDB,
@@ -170,7 +176,8 @@ class TestVedasEngine(unittest.TestCase):
         import subprocess, sys, time
         # Spawn child process that opens the DB and holds the lock
         code = f"""
-import sys, time
+import sys, time, os
+sys.path.insert(0, os.path.abspath('src'))
 from vedasbase import open as vopen
 db = vopen(r"{self.db_path}")
 sys.stdout.write("LOCKED\\n")

@@ -1,7 +1,6 @@
 @echo off
 if exist "%~dp0.venv\Scripts\python.exe" (
-    "%~dp0.venv\Scripts\python.exe" "%~dp0vedasbase.py" %*
+    "%~dp0.venv\Scripts\python.exe" "%~dp0kvdb.py" %*
 ) else (
-    python "%~dp0vedasbase.py" %*
+    python "%~dp0kvdb.py" %*
 )
-
