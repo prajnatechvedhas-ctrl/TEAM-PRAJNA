@@ -5,7 +5,7 @@
 
 ---
 
-## 1. Quick Start & Build
+## 1. Quick Start & Build -
 
 ### Single Build / Preparation Command
 Vedas Base is pure Python standard library. No C-extensions or external wheels are required. To precompile all bytecode for maximum startup speed:
