@@ -123,6 +123,26 @@ class TestRecoveryScenarios(unittest.TestCase):
         with self.assertRaises(CorruptionError):
             vedas_open(self.db_path)
 
+    def test_truncate_one_byte_off_valid_file(self):
+        db = vedas_open(self.db_path)
+        db.put(b"hello", b"world")
+        db.close()
+
+        orig_size = os.path.getsize(self.db_path)
+        # Truncate exactly 1 byte off the end (tears the COMMIT record's CRC32)
+        with open(self.db_path, "r+b") as f:
+            f.truncate(orig_size - 1)
+
+        self.assertEqual(os.path.getsize(self.db_path), orig_size - 1)
+
+        # Open should succeed, detect torn write, and roll back to 16 bytes (file header)
+        db2 = vedas_open(self.db_path)
+        self.assertIsNone(db2.get(b"hello"))
+        self.assertEqual(len(db2.dump()), 0)
+        db2.close()
+
+        self.assertEqual(os.path.getsize(self.db_path), FILE_HEADER_SIZE)
+
 if __name__ == "__main__":
     unittest.main()
 
