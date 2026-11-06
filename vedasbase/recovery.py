@@ -215,3 +215,142 @@ def recover(fd: int, db_path: str) -> Tuple[Dict[bytes, Tuple[int, int]], int, i
     os.lseek(fd, last_valid_commit_offset, os.SEEK_SET)
     next_txid = max_txid + 1
     return index, next_txid, last_valid_commit_offset
+
+
+def check_db_integrity(db_path: str) -> dict:
+    """
+    Performs a non-mutating validation check of the database file.
+    Returns a dictionary of integrity metrics or raises CorruptionError.
+    """
+    if not os.path.exists(db_path):
+        return {
+            "status": "OK",
+            "file_size": 0,
+            "valid_commits": 0,
+            "valid_ops": 0,
+            "live_keys": 0,
+            "uncommitted_bytes": 0,
+            "clean": True,
+        }
+
+    file_size = os.path.getsize(db_path)
+    if file_size < FILE_HEADER_SIZE:
+        return {
+            "status": "CORRUPTED",
+            "error": f"File size ({file_size} bytes) is smaller than header size ({FILE_HEADER_SIZE})",
+            "file_size": file_size,
+        }
+
+    with open(db_path, "rb") as f:
+        header_bytes = f.read(FILE_HEADER_SIZE)
+        magic, ver, _ = struct.unpack_from(FILE_HEADER_FMT, header_bytes, 0)
+        if magic != FILE_MAGIC or ver != FILE_VERSION:
+            return {
+                "status": "CORRUPTED",
+                "error": f"Invalid header: magic={magic!r}, version={ver}",
+                "file_size": file_size,
+            }
+
+        valid_commits = 0
+        valid_ops = 0
+        live_keys = {}
+        pending_ops = []
+        last_valid_offset = FILE_HEADER_SIZE
+
+        buffer = bytearray(RECOVERY_CHUNK_SIZE)
+        view = memoryview(buffer)
+        buf_len = 0
+        file_offset = FILE_HEADER_SIZE
+
+        unpack_from = struct.unpack_from
+        crc32 = zlib.crc32
+
+        while True:
+            needed = RECOVERY_CHUNK_SIZE - buf_len
+            nread = f.readinto(view[buf_len : buf_len + needed])
+            buf_len += nread
+            if buf_len == 0:
+                break
+
+            pos = 0
+            torn = False
+            while pos + 20 <= buf_len:
+                if view[pos] != REC_MAGIC:
+                    torn = True
+                    break
+
+                rmagic, rtype, k_len, v_len, rtxid = unpack_from(REC_HEADER_FMT, view, pos)
+                if rtype not in (TYPE_PUT, TYPE_DELETE, TYPE_COMMIT):
+                    torn = True
+                    break
+                if k_len > MAX_KEY_LEN or v_len > MAX_VAL_LEN:
+                    torn = True
+                    break
+                if rtype == TYPE_COMMIT and (k_len != 0 or v_len != 4):
+                    torn = True
+                    break
+
+                rec_size = 20 + k_len + v_len
+                if pos + rec_size > buf_len:
+                    if nread > 0 and (needed > 0):
+                        break
+                    else:
+                        torn = True
+                        break
+
+                payload_len = 16 + k_len + v_len
+                expected_crc, = unpack_from("<I", view, pos + payload_len)
+                calc_crc = crc32(view[pos : pos + payload_len]) & 0xFFFFFFFF
+                if expected_crc != calc_crc:
+                    torn = True
+                    break
+
+                rec_file_offset = file_offset + pos
+
+                if rtype == TYPE_PUT:
+                    k = bytes(view[pos + 16 : pos + 16 + k_len])
+                    pending_ops.append((TYPE_PUT, k))
+                elif rtype == TYPE_DELETE:
+                    k = bytes(view[pos + 16 : pos + 16 + k_len])
+                    pending_ops.append((TYPE_DELETE, k))
+                elif rtype == TYPE_COMMIT:
+                    op_count, = unpack_from("<I", view, pos + 16)
+                    if len(pending_ops) == op_count:
+                        for op_t, k in pending_ops:
+                            if op_t == TYPE_PUT:
+                                live_keys[k] = True
+                            elif op_t == TYPE_DELETE:
+                                live_keys.pop(k, None)
+                        valid_commits += 1
+                        valid_ops += op_count
+                        last_valid_offset = rec_file_offset + rec_size
+                        pending_ops.clear()
+                    else:
+                        torn = True
+                        break
+
+                pos += rec_size
+
+            if torn:
+                break
+
+            file_offset += pos
+            unconsumed = buf_len - pos
+            if unconsumed > 0:
+                buffer[:unconsumed] = buffer[pos : buf_len]
+            buf_len = unconsumed
+
+            if nread == 0:
+                break
+
+        uncommitted_bytes = file_size - last_valid_offset
+        return {
+            "status": "OK",
+            "file_size": file_size,
+            "valid_commits": valid_commits,
+            "valid_ops": valid_ops,
+            "live_keys": len(live_keys),
+            "uncommitted_bytes": uncommitted_bytes,
+            "clean": uncommitted_bytes == 0,
+        }
+
