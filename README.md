@@ -121,3 +121,4 @@ Every write operation strictly executes 7 steps under a single global lock:
 ```
 An ACK is **never** emitted before Step 5 is durable on disk. Readers execute under the same lock, so no client can observe a half-applied transaction.
 
+﻿# VEDAS BASE - Database Project
