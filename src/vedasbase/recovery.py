@@ -282,9 +282,22 @@ def recover(fd: int, db_path: str) -> Tuple[Dict[bytes, Tuple[int, int]], int, i
                 f"Mid-file corruption detected at offset {torn_offset}: valid commit marker found later at offset {later_commit}. Truncation aborted to protect committed data."
             )
 
+    # Deterministic crash hook: recovery_mid_replay
+    if os.environ.get("VEDAS_CRASH_AT") == "recovery_mid_replay":
+        os._exit(137)
+
     # Truncate torn or uncommitted tail if file extends past last valid commit
     if file_size > last_valid_commit_offset:
+        # Deterministic crash hook: recovery_before_truncate
+        if os.environ.get("VEDAS_CRASH_AT") == "recovery_before_truncate":
+            os._exit(137)
+
         os.ftruncate(fd, last_valid_commit_offset)
+
+        # Deterministic crash hook: recovery_after_truncate_before_fsync
+        if os.environ.get("VEDAS_CRASH_AT") == "recovery_after_truncate_before_fsync":
+            os._exit(137)
+
         os.fsync(fd)
 
     os.lseek(fd, last_valid_commit_offset, os.SEEK_SET)

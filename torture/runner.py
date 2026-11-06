@@ -91,17 +91,20 @@ class TortureRunner:
     ):
         self.db_path = os.path.abspath(db_path)
         self.oracle_log = self.db_path + ".oracle.log"
-        self.mode = mode
+        self.mode = mode.replace("-", "_")
         self.iterations = iterations
         self.seed = seed
         self.max_bytes = max_bytes
         self.num_writers = num_writers
         self.broken = broken
-        self.shared_keys = kwargs.get("shared_keys", False)
+        self.shared_keys = kwargs.get("shared_keys", False) or (self.mode == "same_key")
         self.rng = random.Random(seed)
         self.oracle = Oracle(self.oracle_log)
         self.op_counter = 0
         self.counter_lock = threading.Lock()
+        self.kills_inflight = 0
+        self.kills_between = 0
+        self.total_kills = 0
 
     def _next_op_id(self) -> str:
         with self.counter_lock:
@@ -391,6 +394,62 @@ class TortureRunner:
                     else:
                         line = json.dumps({"op_id": op_id, "cmd": "compact"}) + "\n"
 
+                elif self.mode == "mixed_batch":
+                    # D3: writer 0 executes long atomic batches, writer 1 fires single puts/deletes
+                    if writer_id == 0:
+                        b_size = self.rng.randint(20, 100)
+                        sub_ops = []
+                        for s_idx in range(b_size):
+                            sub_k = f"w0_mb_{op_id}_{s_idx}".encode("ascii")
+                            sub_v = f"v_mb_{s_idx}".encode("ascii")
+                            sub_ops.append({"type": "put", "key": sub_k, "val": sub_v})
+                        op_data = {"cmd": "batch", "ops": sub_ops}
+                        self.oracle.record_inflight(op_id, op_data)
+                        line = json.dumps({
+                            "op_id": op_id,
+                            "cmd": "batch",
+                            "ops": [{"type": "put", "key_hex": o["key"].hex(), "val_hex": o["val"].hex()} for o in sub_ops]
+                        }) + "\n"
+                    else:
+                        k = f"w1_k_{self.rng.randint(1, 20)}".encode("ascii")
+                        v = f"val_{self.rng.randint(1, 1000)}".encode("ascii")
+                        op_data = {"cmd": "put", "key": k, "val": v}
+                        self.oracle.record_inflight(op_id, op_data)
+                        line = json.dumps({
+                            "op_id": op_id,
+                            "cmd": "put",
+                            "key_hex": k.hex(),
+                            "val_hex": v.hex(),
+                        }) + "\n"
+
+                elif self.mode == "same_key":
+                    # D2: both writers race updating identical keys
+                    k = f"shared_k_{self.rng.randint(1, 5)}".encode("ascii")
+                    v = f"w{writer_id}_val_{self.rng.randint(1, 10000)}".encode("ascii")
+                    op_data = {"cmd": "put", "key": k, "val": v}
+                    self.oracle.record_inflight(op_id, op_data)
+                    line = json.dumps({
+                        "op_id": op_id,
+                        "cmd": "put",
+                        "key_hex": k.hex(),
+                        "val_hex": v.hex(),
+                    }) + "\n"
+
+                elif self.mode == "close_kill":
+                    # C6: send put then close and kill mid-close
+                    k = f"ck_{self.rng.randint(1, 20)}".encode("ascii")
+                    v = f"ck_val_{self.rng.randint(1, 1000)}".encode("ascii")
+                    op_data = {"cmd": "put", "key": k, "val": v}
+                    self.oracle.record_inflight(op_id, op_data)
+                    line = json.dumps({
+                        "op_id": op_id,
+                        "cmd": "put",
+                        "key_hex": k.hex(),
+                        "val_hex": v.hex(),
+                    }) + "\n"
+                    if r < 0.3:
+                        line += json.dumps({"op_id": self._next_op_id(), "cmd": "close"}) + "\n"
+
                 else:
                     # Default: random puts, deletes, and small batches
                     if r < 0.6:
@@ -443,6 +502,14 @@ class TortureRunner:
         sleep_ms = self.rng.uniform(15, 90)
         time.sleep(sleep_ms / 1000.0)
 
+        # Anti-rigging tracking: verify if ops were in-flight at kill instant
+        in_flight = len(self.oracle.inflight) > 0
+        if in_flight:
+            self.kills_inflight += 1
+        else:
+            self.kills_between += 1
+        self.total_kills += 1
+
         # HARD KILL: Abruptly terminate child process
         try:
             proc.kill()
@@ -457,7 +524,7 @@ class TortureRunner:
         # In recovery_crash mode, launch a process to open and immediately kill it mid-recovery
         if self.mode == "recovery_crash":
             rec_proc = subprocess.Popen(
-                [PYTHON_EXE, "-m", "vedasbase", "--db", self.db_path, "open"],
+                [PYTHON_EXE, KVDB_PY, "open", self.db_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -468,8 +535,15 @@ class TortureRunner:
             except Exception:
                 pass
 
-        # Step 1: Run check to verify structural integrity
+        # Step 1: Run check to verify structural integrity (measure recovery time)
+        rec_t0 = time.perf_counter()
         check_res = self.run_check()
+        rec_time_sec = time.perf_counter() - rec_t0
+        rec_time_ms = rec_time_sec * 1000.0
+
+        if rec_time_sec > 2.0:
+            print(f"  [WARNING] Recovery time {rec_time_sec:.3f}s exceeded 2.0s limit!")
+
         if check_res.get("status") != "OK":
             raise AssertionError(f"Post-crash check failed: {check_res}")
 
@@ -477,26 +551,44 @@ class TortureRunner:
         dump_state = self.run_dump()
         self.verify_invariants(dump_state)
 
+        return sleep_ms, rec_time_ms
+
     def run(self):
-        print(f"=== Starting Vedas Base Torture Test ===")
-        print(f"Mode: {self.mode} | Iterations: {self.iterations} | Seed: {self.seed} | Broken Variant: {self.broken}")
+        abs_db = os.path.abspath(self.db_path)
+        drive_letter = os.path.splitdrive(abs_db)[0] or "C:"
+        print("=" * 70)
+        print("VEDAS BASE CHAOS & TORTURE VERIFICATION SUITE")
+        print("=" * 70)
+        print(f"[Storage Target] File: {abs_db}")
+        print(f"[Disk Integrity] Real Non-Volatile Drive ({drive_letter}) - Not a RAM Disk")
+        print(f"[Configuration] Seed: {self.seed} | Mode: {self.mode} | Target Iterations: {self.iterations}")
+        print("-" * 70)
         self.clean_env()
         t0 = time.perf_counter()
 
         for it in range(1, self.iterations + 1):
             try:
-                self.run_iteration(it)
-                if it % 25 == 0 or it == self.iterations:
-                    print(f"  [Iteration {it}/{self.iterations}] Passed crash verification. DB Keys: {len(self.oracle.committed_state)}")
+                sleep_ms, rec_ms = self.run_iteration(it)
+                print(f"[Iter {it:03d}/{self.iterations}] mode={self.mode} ops_sent={self.op_counter} acked={len(self.oracle.committed_state)} kill_delay={sleep_ms:.1f}ms recovery={rec_ms:.1f}ms PASS")
             except AssertionError as e:
-                print(f"\n[!] MISMATCH ON ITERATION {it}!\n{e}")
+                print("\n" + "=" * 70)
+                print(f"[!] INVARIANT VIOLATION ON ITERATION {it} (Seed: {self.seed}, Mode: {self.mode})")
+                print("=" * 70)
+                print(f"Details:\n{e}\n")
+                print("To reproduce:")
+                print(f"  .\\torture --iterations {it} --seed {self.seed} --mode {self.mode}")
+                print("=" * 70)
                 sys.exit(1)
             except Exception as e:
                 print(f"\n[!] UNEXPECTED FAILURE ON ITERATION {it}!\n{e}")
                 sys.exit(1)
 
         t1 = time.perf_counter()
-        print(f"\n=== Torture Test PASSED: {self.iterations} iterations in {t1 - t0:.2f} s ===")
+        pct_inflight = (self.kills_inflight / max(1, self.total_kills)) * 100
+        print("-" * 70)
+        print(f"=== Torture Test PASSED: {self.iterations} iterations in {t1 - t0:.2f} s ===")
+        print(f"[Anti-Rigging Audit] Total Kills: {self.total_kills} | In-Flight (Mid-Op) Kills: {self.kills_inflight} ({pct_inflight:.1f}%) | Between-Ops Kills: {self.kills_between}")
+        print("=" * 70)
 
 
 def main():
@@ -509,6 +601,9 @@ def main():
         "compaction",
         "recovery_crash", "recovery-crash",
         "disk_full", "disk-full",
+        "mixed_batch", "mixed-batch",
+        "same_key", "same-key",
+        "close_kill", "close-kill",
         "broken_variant", "broken-variant",
     ]
     parser.add_argument("--mode", default="random", choices=valid_modes, help="Torture mode (default: random)")

@@ -119,6 +119,13 @@ def serve_loop(db: VedasDB, num_workers: int = 4):
                             sys.stdout.buffer.write(f"ACK {op_id}\n".encode("ascii"))
                             sys.stdout.buffer.flush()
 
+                elif cmd == "close":
+                    if not corrupt_early:
+                        with stdout_lock:
+                            sys.stdout.buffer.write(f"ACK {op_id}\n".encode("ascii"))
+                            sys.stdout.buffer.flush()
+                    stop_event.set()
+
                 else:
                     with stdout_lock:
                         sys.stdout.buffer.write(f"ERR {op_id} Unknown command '{cmd}'\n".encode("utf-8"))
@@ -141,11 +148,41 @@ def serve_loop(db: VedasDB, num_workers: int = 4):
     try:
         # Use binary input buffer on Windows to avoid newline translation
         manual_counter = 0
+        batch_mode = False
+        batch_id = ""
+        batch_ops = []
+
         for raw_line in sys.stdin.buffer:
             raw_line = raw_line.strip()
             if not raw_line:
                 continue
-            line_str = raw_line.decode("utf-8", errors="replace")
+            line_str = raw_line.decode("utf-8", errors="replace").strip()
+            if not line_str or line_str.startswith("#"):
+                continue
+
+            # Check if collecting a multi-line batch block
+            if batch_mode:
+                if line_str.lower() in ("end", "commit"):
+                    batch_mode = False
+                    work_queue.put((batch_id, "batch", {"op_id": batch_id, "cmd": "batch", "ops": batch_ops}))
+                    batch_ops = []
+                    continue
+
+                b_parts = line_str.split(" ", 2)
+                sub_cmd = b_parts[0].lower()
+                if sub_cmd == "put":
+                    k = b_parts[1]
+                    v = b_parts[2] if len(b_parts) > 2 else ""
+                    batch_ops.append({"type": "put", "key": k, "val": v})
+                elif sub_cmd in ("del", "delete"):
+                    k = b_parts[1]
+                    batch_ops.append({"type": "del", "key": k})
+                else:
+                    with stdout_lock:
+                        sys.stdout.buffer.write(f"ERR {batch_id} Unknown batch op: {line_str}\n".encode("utf-8"))
+                        sys.stdout.buffer.flush()
+                continue
+
             if line_str.startswith("{"):
                 try:
                     data = json.loads(line_str)
@@ -154,34 +191,64 @@ def serve_loop(db: VedasDB, num_workers: int = 4):
                         sys.stdout.buffer.write(f"ERR unknown Invalid JSON: {e}\n".encode("utf-8"))
                         sys.stdout.buffer.flush()
                     continue
-            else:
-                # Text line support: put k v / get k / del k / compact
-                parts = line_str.split(" ", 2)
-                t_cmd = parts[0].lower()
+                op_id = data.get("op_id", "0")
+                cmd = data.get("cmd", "").lower()
+                if cmd in ("exit", "quit"):
+                    break
+                work_queue.put((op_id, cmd, data))
+                continue
+
+            # Human-friendly line syntax:
+            # Check for batch start: "batch <op-id>" or "begin <op-id>"
+            parts = line_str.split(" ", 1)
+            first_tok = parts[0].lower()
+            if first_tok in ("batch", "begin"):
+                batch_mode = True
+                manual_counter += 1
+                batch_id = parts[1].strip() if len(parts) > 1 else f"b{manual_counter}"
+                batch_ops = []
+                continue
+
+            # Check if line starts with an op_id: "<op-id> <cmd> [args...]"
+            KNOWN_CMDS = {"put", "get", "del", "delete", "compact", "close", "exit", "quit"}
+            tokens = line_str.split(" ", 3)
+            if len(tokens) >= 2 and tokens[1].lower() in KNOWN_CMDS:
+                op_id = tokens[0]
+                t_cmd = tokens[1].lower()
+                rest = tokens[2:]
+            elif tokens[0].lower() in KNOWN_CMDS:
                 manual_counter += 1
                 op_id = f"m{manual_counter}"
-                if t_cmd == "put" and len(parts) >= 3:
-                    data = {"op_id": op_id, "cmd": "put", "key": parts[1], "val": parts[2]}
-                elif t_cmd == "get" and len(parts) >= 2:
-                    data = {"op_id": op_id, "cmd": "get", "key": parts[1]}
-                elif t_cmd in ("del", "delete") and len(parts) >= 2:
-                    data = {"op_id": op_id, "cmd": "del", "key": parts[1]}
-                elif t_cmd == "compact":
-                    data = {"op_id": op_id, "cmd": "compact"}
-                elif t_cmd in ("exit", "quit"):
-                    break
-                else:
-                    with stdout_lock:
-                        sys.stdout.buffer.write(f"ERR {op_id} Unknown command line: {line_str}\n".encode("utf-8"))
-                        sys.stdout.buffer.flush()
-                    continue
+                t_cmd = tokens[0].lower()
+                rest = tokens[1:]
+            else:
+                with stdout_lock:
+                    sys.stdout.buffer.write(f"ERR unknown Unknown command line: {line_str}\n".encode("utf-8"))
+                    sys.stdout.buffer.flush()
+                continue
 
-            op_id = data.get("op_id", "0")
-            cmd = data.get("cmd", "").lower()
-            if cmd in ("exit", "quit"):
+            if t_cmd in ("exit", "quit"):
                 break
 
-            work_queue.put((op_id, cmd, data))
+            if t_cmd == "put":
+                if len(rest) < 1:
+                    with stdout_lock:
+                        sys.stdout.buffer.write(f"ERR {op_id} put requires key and value\n".encode("utf-8"))
+                        sys.stdout.buffer.flush()
+                    continue
+                k = rest[0]
+                v = rest[1] if len(rest) > 1 else ""
+                work_queue.put((op_id, "put", {"op_id": op_id, "cmd": "put", "key": k, "val": v}))
+            elif t_cmd == "get":
+                k = rest[0] if len(rest) > 0 else ""
+                work_queue.put((op_id, "get", {"op_id": op_id, "cmd": "get", "key": k}))
+            elif t_cmd in ("del", "delete"):
+                k = rest[0] if len(rest) > 0 else ""
+                work_queue.put((op_id, "del", {"op_id": op_id, "cmd": "del", "key": k}))
+            elif t_cmd == "compact":
+                work_queue.put((op_id, "compact", {"op_id": op_id, "cmd": "compact"}))
+            elif t_cmd == "close":
+                work_queue.put((op_id, "close", {"op_id": op_id, "cmd": "close"}))
 
         work_queue.join()
     finally:

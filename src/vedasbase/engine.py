@@ -190,12 +190,16 @@ class VedasDB:
                 # Seek to current committed tail
                 os.lseek(self._fd, current_file_size, os.SEEK_SET)
 
+                # Deterministic crash hook: before_write
+                if os.environ.get("VEDAS_CRASH_AT") == "before_write":
+                    os._exit(137)
+
                 # STEP 2: Write the op record(s).
                 # Disk state if killed here: Uncommitted ops without commit marker.
                 # Recovery action: Ignored and truncated back to rollback_offset.
                 op_offsets = []  # Track for index update
                 write_pos = current_file_size
-                for op_type, k, v in norm_ops:
+                for op_idx, (op_type, k, v) in enumerate(norm_ops):
                     if op_type == TYPE_PUT:
                         rec = encode_put_record(k, v, txid)
                         val_off = write_pos + 16 + len(k)
@@ -203,16 +207,33 @@ class VedasDB:
                     else:
                         rec = encode_delete_record(k, txid)
                         op_offsets.append((TYPE_DELETE, k, 0, 0))
-                    
+
+                    # Deterministic crash hook: mid_record (write partial record bytes)
+                    if os.environ.get("VEDAS_CRASH_AT") == "mid_record":
+                        os.write(self._fd, rec[: len(rec) // 2])
+                        os._exit(137)
+
+                    # Deterministic crash hook: mid_batch (kill after K ops, e.g. 3 of 10)
+                    if os.environ.get("VEDAS_CRASH_AT") == "mid_batch" and op_idx == 3:
+                        os._exit(137)
+
                     nwritten = os.write(self._fd, rec)
                     if nwritten != len(rec):
                         raise VedasError("Short write during op record output")
                     write_pos += len(rec)
 
+                # Deterministic crash hook: after_record_before_fsync
+                if os.environ.get("VEDAS_CRASH_AT") == "after_record_before_fsync":
+                    os._exit(137)
+
                 # STEP 3: os.fsync(fd).
                 # Disk state if killed here: Op records durable on disk, but uncommitted.
                 # Recovery action: Op count mismatch or missing commit marker; ops ignored and truncated.
                 os.fsync(self._fd)
+
+                # Deterministic crash hook: after_record_fsync / after_ops_before_commit
+                if os.environ.get("VEDAS_CRASH_AT") in ("after_record_fsync", "after_ops_before_commit"):
+                    os._exit(137)
 
                 # STEP 4: Write the COMMIT marker.
                 # Disk state if killed here: Commit marker partially or fully written to kernel buffers.
@@ -224,11 +245,19 @@ class VedasDB:
                         raise VedasError("Short write during commit marker output")
                     write_pos += len(commit_rec)
 
+                # Deterministic crash hook: after_commit_before_fsync
+                if os.environ.get("VEDAS_CRASH_AT") == "after_commit_before_fsync":
+                    os._exit(137)
+
                 # STEP 5: os.fsync(fd).
                 # Disk state if killed here: Both op records and commit marker are durable.
                 # Recovery action: Replay reconstructs complete committed batch.
                 if not skip_commit_fsync:
                     os.fsync(self._fd)
+
+                # Deterministic crash hook: after_commit_fsync_before_ack
+                if os.environ.get("VEDAS_CRASH_AT") == "after_commit_fsync_before_ack":
+                    os._exit(137)
 
                 # STEP 6: Update the in-memory index in one step, still under the lock.
                 for op_type, k, v_off, v_len in op_offsets:
@@ -286,6 +315,8 @@ class VedasDB:
         with self._lock:
             if self._closed:
                 return
+            if os.environ.get("VEDAS_CRASH_AT") == "close_mid":
+                os._exit(137)
             self._closed = True
             if self._fd is not None:
                 try:

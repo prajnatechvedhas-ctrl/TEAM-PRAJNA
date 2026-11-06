@@ -87,8 +87,17 @@ def run_compaction(engine) -> int:
         os.write(temp_fd, commit_bytes)
         cur_offset += len(commit_bytes)
 
+        # Deterministic crash hook: compact_before_temp_fsync
+        if os.environ.get("VEDAS_CRASH_AT") == "compact_before_temp_fsync":
+            os._exit(137)
+
         # Step 5: Fsync temp file and close
         os.fsync(temp_fd)
+
+        # Deterministic crash hook: compact_after_temp_fsync
+        if os.environ.get("VEDAS_CRASH_AT") == "compact_after_temp_fsync":
+            os._exit(137)
+
         os.close(temp_fd)
         temp_fd = None
 
@@ -96,11 +105,23 @@ def run_compaction(engine) -> int:
         os.close(engine._fd)
         engine._fd = None
 
+        # Deterministic crash hook: compact_before_replace
+        if os.environ.get("VEDAS_CRASH_AT") == "compact_before_replace":
+            os._exit(137)
+
         # Step 7: Atomic rename
         os.replace(temp_path, db_path)
 
+        # Deterministic crash hook: compact_after_replace_before_dirsync
+        if os.environ.get("VEDAS_CRASH_AT") == "compact_after_replace_before_dirsync":
+            os._exit(137)
+
         # Step 8: Fsync directory
         fsync_directory_if_supported(dir_name)
+
+        # Deterministic crash hook: compact_after_replace_before_cleanup
+        if os.environ.get("VEDAS_CRASH_AT") == "compact_after_replace_before_cleanup":
+            os._exit(137)
 
         # Step 9: Re-open db_path in read/write mode
         rw_flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
