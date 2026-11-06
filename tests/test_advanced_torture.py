@@ -272,7 +272,7 @@ class TestAdvancedTorture(unittest.TestCase):
             r.start()
         for w in writers:
             w.start()
-
+# 
         for w in writers:
             w.join()
 
