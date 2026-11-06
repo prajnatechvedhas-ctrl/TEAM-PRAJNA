@@ -66,3 +66,4 @@ Because `fsync` at Step 3 precedes `write` at Step 4, and `fsync` at Step 5 prec
    Implement sparse file punching (`FALLOC_FL_PUNCH_HOLE` on Linux or `FSCTL_SET_ZERO_DATA` on Windows) to punch holes in the log for obsolete tombstones, reducing the need for full-file rewriting during compaction.
 3. **Partitioned / Striped Reader Locks**:
    Replace the single global lock with a Read-Write Lock (`threading.RLock` or shared read locks) so multiple concurrent `get()` requests execute in parallel without blocking one another.
+

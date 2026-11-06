@@ -299,3 +299,4 @@ class VedasDB:
 def open_db(path: str, max_bytes: int = 10 * 1024 * 1024 * 1024) -> VedasDB:
     """Convenience factory function matching open(path, max_bytes)."""
     return VedasDB(path, max_bytes)
+

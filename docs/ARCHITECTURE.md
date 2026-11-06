@@ -153,3 +153,4 @@ If a crash occurs before the commit marker is verified, $\text{pending\_ops}$ is
 Let $F_t$ be the file state at time $t$ and $O$ be the idempotent truncate operator. Since every committed block is terminated by a verified COMMIT record at byte offset $C$, any uncommitted suffix from $(C, \text{EOF}]$ is truncated:
 $$R(R(F)) = R(F)$$
 Recovery does not append new records; it only truncates uncommitted bytes back to $C$. Running recovery $k$ times produces identical state and byte-for-byte identical file contents.
+

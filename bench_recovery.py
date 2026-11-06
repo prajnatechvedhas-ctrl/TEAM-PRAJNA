@@ -172,3 +172,4 @@ if __name__ == "__main__":
     finally:
         if os.path.exists(fname):
             os.remove(fname)
+

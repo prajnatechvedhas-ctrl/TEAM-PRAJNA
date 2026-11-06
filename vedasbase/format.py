@@ -98,3 +98,4 @@ def encode_commit_record(op_count: int, txid: int) -> bytes:
     payload = hdr + struct.pack("<I", op_count)
     crc = zlib.crc32(payload) & 0xFFFFFFFF
     return payload + struct.pack("<I", crc)
+

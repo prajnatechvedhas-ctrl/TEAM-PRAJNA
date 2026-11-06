@@ -25,3 +25,4 @@ class LockError(VedasError):
 class ClosedError(VedasError):
     """Raised when an operation is attempted on a closed database instance."""
     pass
+

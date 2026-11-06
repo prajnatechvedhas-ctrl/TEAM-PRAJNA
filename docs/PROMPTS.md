@@ -10,3 +10,4 @@
 2. **Single Data File**: All authoritative state resides in exactly one file; sidecar lockfile and atomic compaction temp files.
 3. **Strict 7-Step Write Ordering**: Checked space -> write op records -> fsync -> write COMMIT marker -> fsync -> update in-memory index -> return.
 4. **Chaos Verification**: Independent torture harness with external oracle and hard kill testing across all failure modes.
+

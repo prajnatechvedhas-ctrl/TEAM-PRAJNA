@@ -136,3 +136,4 @@ def run_compaction(engine) -> int:
             engine._fd = os.open(db_path, rw_flags, 0o644)
             os.lseek(engine._fd, engine._last_committed_offset, os.SEEK_SET)
         raise
+
