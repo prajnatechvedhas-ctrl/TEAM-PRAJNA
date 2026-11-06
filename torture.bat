@@ -4,3 +4,4 @@ if exist "%~dp0.venv\Scripts\python.exe" (
 ) else (
     python "%~dp0torture.py" %*
 )
+

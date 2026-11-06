@@ -7,3 +7,4 @@ elif [ -f "$DIR/.venv/bin/python" ]; then
 else
     python3 "$DIR/torture.py" "$@" 2>/dev/null || python "$DIR/torture.py" "$@"
 fi
+
