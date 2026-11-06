@@ -3,9 +3,15 @@ Unit tests for crash recovery, torn writes, and CRC corruption.
 """
 
 import os
+import sys
 import unittest
 import struct
 import zlib
+
+SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
 from vedasbase import open as vedas_open, CorruptionError
 from vedasbase.format import (
     FILE_MAGIC,
@@ -122,6 +128,70 @@ class TestRecoveryScenarios(unittest.TestCase):
 
         with self.assertRaises(CorruptionError):
             vedas_open(self.db_path)
+
+    def test_truncate_one_byte_off_valid_file(self):
+        db = vedas_open(self.db_path)
+        db.put(b"hello", b"world")
+        db.close()
+
+        orig_size = os.path.getsize(self.db_path)
+        # Truncate exactly 1 byte off the end (tears the COMMIT record's CRC32)
+        with open(self.db_path, "r+b") as f:
+            f.truncate(orig_size - 1)
+
+        self.assertEqual(os.path.getsize(self.db_path), orig_size - 1)
+
+        # Open should succeed, detect torn write, and roll back to 16 bytes (file header)
+        db2 = vedas_open(self.db_path)
+        self.assertIsNone(db2.get(b"hello"))
+        self.assertEqual(len(db2.dump()), 0)
+        db2.close()
+
+        self.assertEqual(os.path.getsize(self.db_path), FILE_HEADER_SIZE)
+
+    def test_recovery_txid_mismatch_rejected(self):
+        # Write record with txid=5, but commit marker with txid=6
+        with open(self.db_path, "wb") as f:
+            f.write(struct.pack(FILE_HEADER_FMT, FILE_MAGIC, 1, 0))
+            rec = encode_put_record(b"orphan_key", b"val", 5)
+            f.write(rec)
+            # Commit marker has txid=6 (mismatch!)
+            commit = encode_commit_record(1, 6)
+            f.write(commit)
+
+        # Recovery must reject the mismatched batch and truncate back to header
+        db = vedas_open(self.db_path)
+        self.assertIsNone(db.get(b"orphan_key"))
+        self.assertEqual(len(db.dump()), 0)
+        db.close()
+        self.assertEqual(os.path.getsize(self.db_path), FILE_HEADER_SIZE)
+
+    def test_mid_file_corruption_detected_not_truncated(self):
+        from vedasbase.recovery import check_db_integrity
+        db = vedas_open(self.db_path)
+        db.put(b"batch_1", b"val_1")  # txid 1
+        db.put(b"batch_2", b"val_2")  # txid 2
+        db.put(b"batch_3", b"val_3")  # txid 3
+        db.close()
+
+        orig_size = os.path.getsize(self.db_path)
+
+        # Mutate batch 2 payload (offset ~60-80)
+        with open(self.db_path, "r+b") as f:
+            f.seek(64)
+            f.write(b"\xFF\xFE\xFD")
+
+        # check_db_integrity must report CORRUPTED with mid-file corruption
+        res = check_db_integrity(self.db_path)
+        self.assertEqual(res["status"], "CORRUPTED")
+        self.assertIn("Mid-file corruption", res["error"])
+
+        # open() must raise CorruptionError and NOT truncate the file
+        with self.assertRaises(CorruptionError):
+            vedas_open(self.db_path)
+
+        # File size must be untouched to protect subsequent valid data
+        self.assertEqual(os.path.getsize(self.db_path), orig_size)
 
 if __name__ == "__main__":
     unittest.main()

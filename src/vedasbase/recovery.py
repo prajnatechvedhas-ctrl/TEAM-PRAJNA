@@ -11,7 +11,7 @@ import os
 import glob
 import struct
 import zlib
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 from .errors import CorruptionError
 from .format import (
@@ -32,6 +32,49 @@ from .format import (
 )
 
 RECOVERY_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB sequential read buffer
+
+def _find_valid_commit_after(fd: int, start_offset: int, file_size: int, min_txid: int = 0) -> Optional[int]:
+    """
+    Scans from start_offset to EOF searching for any valid COMMIT marker with txid > min_txid.
+    Returns the offset of a valid subsequent commit marker if found, or None.
+    Distinguishes a torn uncommitted tail at EOF from mid-file corruption.
+    """
+    if start_offset >= file_size:
+        return None
+
+    scan_buf_size = 1024 * 1024
+    cur = start_offset
+    unpack_from = struct.unpack_from
+    crc32 = zlib.crc32
+
+    while cur < file_size:
+        to_read = min(scan_buf_size, file_size - cur)
+        os.lseek(fd, cur, os.SEEK_SET)
+        chunk = os.read(fd, to_read)
+        if not chunk:
+            break
+
+        idx = 0
+        while True:
+            idx = chunk.find(b"\xa7", idx)
+            if idx == -1:
+                break
+            cand_offset = cur + idx
+            if cand_offset + 24 <= file_size:
+                os.lseek(fd, cand_offset, os.SEEK_SET)
+                cand_bytes = os.read(fd, 24)
+                if len(cand_bytes) == 24:
+                    rmagic, rtype, k_len, v_len, rtxid = unpack_from(REC_HEADER_FMT, cand_bytes, 0)
+                    if rmagic == REC_MAGIC and rtype == TYPE_COMMIT and k_len == 0 and v_len == 4:
+                        expected_crc, = unpack_from("<I", cand_bytes, 20)
+                        calc_crc = crc32(cand_bytes[:20]) & 0xFFFFFFFF
+                        if expected_crc == calc_crc and rtxid > min_txid:
+                            return cand_offset
+            idx += 1
+
+        cur += to_read
+
+    return None
 
 def cleanup_temp_files(db_path: str):
     """Deletes any leftover compaction or temporary files from previous crashed sessions."""
@@ -96,9 +139,13 @@ def recover(fd: int, db_path: str) -> Tuple[Dict[bytes, Tuple[int, int]], int, i
 
     # Fast sequential recovery using buffered reads and memoryviews
     index: Dict[bytes, Tuple[int, int]] = {}
-    pending_ops = []  # List of (type, key, val_off, val_len)
+    pending_ops = []  # List of (type, key, val_off, val_len, rtxid)
     last_valid_commit_offset = FILE_HEADER_SIZE
     max_txid = 0
+    torn_detected = False
+    torn_offset = FILE_HEADER_SIZE
+    corrupt_txid = 0
+    start_search = FILE_HEADER_SIZE
 
     unpack_from = struct.unpack_from
     crc32 = zlib.crc32
@@ -120,25 +167,33 @@ def recover(fd: int, db_path: str) -> Tuple[Dict[bytes, Tuple[int, int]], int, i
             break
 
         pos = 0
-        torn_detected = False
 
         while pos + 20 <= buf_len:
             # Check record magic byte 0xA7
             if view[pos] != REC_MAGIC:
                 torn_detected = True
+                torn_offset = file_offset + pos
+                start_search = torn_offset + 1
                 break
 
             rmagic, rtype, k_len, v_len, rtxid = unpack_from(REC_HEADER_FMT, view, pos)
+            corrupt_txid = max(corrupt_txid, rtxid)
 
             # Sanity check fields
             if rtype not in (TYPE_PUT, TYPE_DELETE, TYPE_COMMIT):
                 torn_detected = True
+                torn_offset = file_offset + pos
+                start_search = torn_offset + 20
                 break
             if k_len > MAX_KEY_LEN or v_len > MAX_VAL_LEN:
                 torn_detected = True
+                torn_offset = file_offset + pos
+                start_search = torn_offset + 20
                 break
             if rtype == TYPE_COMMIT and (k_len != 0 or v_len != 4):
                 torn_detected = True
+                torn_offset = file_offset + pos
+                start_search = torn_offset + 24
                 break
 
             rec_size = 20 + k_len + v_len
@@ -151,6 +206,8 @@ def recover(fd: int, db_path: str) -> Tuple[Dict[bytes, Tuple[int, int]], int, i
                 else:
                     # EOF reached without full record -> torn write
                     torn_detected = True
+                    torn_offset = file_offset + pos
+                    start_search = file_size
                     break
 
             # Verify CRC32
@@ -159,6 +216,8 @@ def recover(fd: int, db_path: str) -> Tuple[Dict[bytes, Tuple[int, int]], int, i
             calc_crc = crc32(view[pos : pos + payload_len]) & 0xFFFFFFFF
             if expected_crc != calc_crc:
                 torn_detected = True
+                torn_offset = file_offset + pos
+                start_search = torn_offset + rec_size
                 break
 
             rec_file_offset = file_offset + pos
@@ -166,15 +225,16 @@ def recover(fd: int, db_path: str) -> Tuple[Dict[bytes, Tuple[int, int]], int, i
             if rtype == TYPE_PUT:
                 k = bytes(view[pos + 16 : pos + 16 + k_len])
                 v_off = rec_file_offset + 16 + k_len
-                pending_ops.append((TYPE_PUT, k, v_off, v_len))
+                pending_ops.append((TYPE_PUT, k, v_off, v_len, rtxid))
             elif rtype == TYPE_DELETE:
                 k = bytes(view[pos + 16 : pos + 16 + k_len])
-                pending_ops.append((TYPE_DELETE, k, 0, 0))
+                pending_ops.append((TYPE_DELETE, k, 0, 0, rtxid))
             elif rtype == TYPE_COMMIT:
                 op_count, = unpack_from("<I", view, pos + 16)
-                if len(pending_ops) == op_count:
+                txids_match = all(op[4] == rtxid for op in pending_ops)
+                if len(pending_ops) == op_count and txids_match:
                     # Apply all batch ops atomically to index
-                    for op_type, k, v_off, v_l in pending_ops:
+                    for op_type, k, v_off, v_l, _ in pending_ops:
                         if op_type == TYPE_PUT:
                             index[k] = (v_off, v_l)
                         elif op_type == TYPE_DELETE:
@@ -184,13 +244,17 @@ def recover(fd: int, db_path: str) -> Tuple[Dict[bytes, Tuple[int, int]], int, i
                         max_txid = rtxid
                     pending_ops.clear()
                 else:
-                    # Op count mismatch: torn or uncommitted batch
+                    # Op count or txid mismatch: torn or uncommitted batch
                     torn_detected = True
+                    torn_offset = rec_file_offset
+                    start_search = rec_file_offset + rec_size
                     break
 
             pos += rec_size
 
         if torn_detected:
+            if pending_ops:
+                corrupt_txid = max(corrupt_txid, max(op[4] for op in pending_ops))
             # Stop scan immediately; uncommitted ops in pending_ops are ignored
             pending_ops.clear()
             break
@@ -206,10 +270,34 @@ def recover(fd: int, db_path: str) -> Tuple[Dict[bytes, Tuple[int, int]], int, i
             # Reached true EOF
             break
 
-    # Truncate torn or uncommitted tail if file extends past last valid commit
     stat = os.fstat(fd)
-    if stat.st_size > last_valid_commit_offset:
+    file_size = stat.st_size
+
+    # Check for mid-file corruption vs torn tail
+    if torn_detected:
+        min_search_txid = max(max_txid, corrupt_txid)
+        later_commit = _find_valid_commit_after(fd, start_search, file_size, min_txid=min_search_txid)
+        if later_commit is not None:
+            raise CorruptionError(
+                f"Mid-file corruption detected at offset {torn_offset}: valid commit marker found later at offset {later_commit}. Truncation aborted to protect committed data."
+            )
+
+    # Deterministic crash hook: recovery_mid_replay
+    if os.environ.get("VEDAS_CRASH_AT") == "recovery_mid_replay":
+        os._exit(137)
+
+    # Truncate torn or uncommitted tail if file extends past last valid commit
+    if file_size > last_valid_commit_offset:
+        # Deterministic crash hook: recovery_before_truncate
+        if os.environ.get("VEDAS_CRASH_AT") == "recovery_before_truncate":
+            os._exit(137)
+
         os.ftruncate(fd, last_valid_commit_offset)
+
+        # Deterministic crash hook: recovery_after_truncate_before_fsync
+        if os.environ.get("VEDAS_CRASH_AT") == "recovery_after_truncate_before_fsync":
+            os._exit(137)
+
         os.fsync(fd)
 
     os.lseek(fd, last_valid_commit_offset, os.SEEK_SET)
@@ -239,6 +327,7 @@ def check_db_integrity(db_path: str) -> dict:
             "status": "CORRUPTED",
             "error": f"File size ({file_size} bytes) is smaller than header size ({FILE_HEADER_SIZE})",
             "file_size": file_size,
+            "clean": False,
         }
 
     with open(db_path, "rb") as f:
@@ -249,13 +338,17 @@ def check_db_integrity(db_path: str) -> dict:
                 "status": "CORRUPTED",
                 "error": f"Invalid header: magic={magic!r}, version={ver}",
                 "file_size": file_size,
+                "clean": False,
             }
 
         valid_commits = 0
         valid_ops = 0
+        max_txid = 0
         live_keys = {}
         pending_ops = []
         last_valid_offset = FILE_HEADER_SIZE
+        corrupt_txid = 0
+        start_search = FILE_HEADER_SIZE
 
         buffer = bytearray(RECOVERY_CHUNK_SIZE)
         view = memoryview(buffer)
@@ -277,17 +370,27 @@ def check_db_integrity(db_path: str) -> dict:
             while pos + 20 <= buf_len:
                 if view[pos] != REC_MAGIC:
                     torn = True
+                    torn_offset = file_offset + pos
+                    start_search = torn_offset + 1
                     break
 
                 rmagic, rtype, k_len, v_len, rtxid = unpack_from(REC_HEADER_FMT, view, pos)
+                corrupt_txid = max(corrupt_txid, rtxid)
+
                 if rtype not in (TYPE_PUT, TYPE_DELETE, TYPE_COMMIT):
                     torn = True
+                    torn_offset = file_offset + pos
+                    start_search = torn_offset + 20
                     break
                 if k_len > MAX_KEY_LEN or v_len > MAX_VAL_LEN:
                     torn = True
+                    torn_offset = file_offset + pos
+                    start_search = torn_offset + 20
                     break
                 if rtype == TYPE_COMMIT and (k_len != 0 or v_len != 4):
                     torn = True
+                    torn_offset = file_offset + pos
+                    start_search = torn_offset + 24
                     break
 
                 rec_size = 20 + k_len + v_len
@@ -296,6 +399,8 @@ def check_db_integrity(db_path: str) -> dict:
                         break
                     else:
                         torn = True
+                        torn_offset = file_offset + pos
+                        start_search = file_size
                         break
 
                 payload_len = 16 + k_len + v_len
@@ -303,35 +408,60 @@ def check_db_integrity(db_path: str) -> dict:
                 calc_crc = crc32(view[pos : pos + payload_len]) & 0xFFFFFFFF
                 if expected_crc != calc_crc:
                     torn = True
+                    torn_offset = file_offset + pos
+                    start_search = torn_offset + rec_size
                     break
 
                 rec_file_offset = file_offset + pos
 
                 if rtype == TYPE_PUT:
                     k = bytes(view[pos + 16 : pos + 16 + k_len])
-                    pending_ops.append((TYPE_PUT, k))
+                    pending_ops.append((TYPE_PUT, k, rtxid))
                 elif rtype == TYPE_DELETE:
                     k = bytes(view[pos + 16 : pos + 16 + k_len])
-                    pending_ops.append((TYPE_DELETE, k))
+                    pending_ops.append((TYPE_DELETE, k, rtxid))
                 elif rtype == TYPE_COMMIT:
                     op_count, = unpack_from("<I", view, pos + 16)
-                    if len(pending_ops) == op_count:
-                        for op_t, k in pending_ops:
+                    txids_match = all(op[2] == rtxid for op in pending_ops)
+                    if len(pending_ops) == op_count and txids_match:
+                        for op_t, k, _ in pending_ops:
                             if op_t == TYPE_PUT:
                                 live_keys[k] = True
                             elif op_t == TYPE_DELETE:
                                 live_keys.pop(k, None)
                         valid_commits += 1
                         valid_ops += op_count
+                        if rtxid > max_txid:
+                            max_txid = rtxid
                         last_valid_offset = rec_file_offset + rec_size
                         pending_ops.clear()
                     else:
                         torn = True
+                        torn_offset = rec_file_offset
+                        start_search = rec_file_offset + rec_size
                         break
 
                 pos += rec_size
 
             if torn:
+                if 'torn_offset' not in locals():
+                    torn_offset = file_offset + pos
+                    start_search = torn_offset + 20
+                if pending_ops:
+                    corrupt_txid = max(corrupt_txid, max(op[2] for op in pending_ops))
+                # Check for mid-file corruption vs torn tail
+                min_search_txid = max(max_txid, corrupt_txid)
+                later_commit = _find_valid_commit_after(f.fileno(), start_search, file_size, min_txid=min_search_txid)
+                if later_commit is not None:
+                    return {
+                        "status": "CORRUPTED",
+                        "error": f"Mid-file corruption at offset {torn_offset} followed by valid commit marker at {later_commit}",
+                        "file_size": file_size,
+                        "valid_commits": valid_commits,
+                        "valid_ops": valid_ops,
+                        "uncommitted_bytes": file_size - last_valid_offset,
+                        "clean": False,
+                    }
                 break
 
             file_offset += pos

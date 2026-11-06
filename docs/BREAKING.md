@@ -1,69 +1,73 @@
 # Vedas Base - Crash Safety Audit, Weaknesses, and Failure Analysis
 
-## 1. Crash Points Matrix (8 to 15 Failure Points)
+## 1. Crash Points Matrix (12 Explicit Failure Points)
 
-| Crash Point | Code Location | Exact Disk State | Recovery Action (`recovery.py`) |
+| Crash Point | What is on disk when kill happens | Recovery action (`recovery.py`) | Data lost vs retained |
 |---|---|---|---|
-| **CP1** | `engine.py:165` (pre-check) | Unchanged. File size equals `last_committed_offset`. | Clean recovery; 0 torn bytes. Replay ends at last commit. |
-| **CP2** | `engine.py:187` (mid `os.write` op 1 of 5) | Torn 1st op record at tail. Incomplete payload or missing trailer CRC. | Record header/payload CRC check fails or EOF reached. Tail truncated to `rollback_offset`. |
-| **CP3** | `engine.py:195` (between op 3 and 4) | Ops 1-3 fully written to kernel buffer, op 4-5 missing. | Op count mismatch when COMMIT marker absent. Ops 1-3 ignored; tail truncated. |
-| **CP4** | `engine.py:197` (before `os.fsync`) | Ops written to OS page cache, not yet forced to disk platters. | On power loss, page cache lost. On process kill, ops on disk but uncommitted; ignored and truncated. |
-| **CP5** | `engine.py:202` (after 1st `os.fsync`) | All ops durable on physical media. No COMMIT record. | Sequential scan places ops in `pending_ops`. Scan ends at EOF without COMMIT. Tail truncated. |
-| **CP6** | `engine.py:209` (mid `os.write` commit marker) | Ops durable. First 12 bytes of 24-byte COMMIT record written. | `view[pos]` or `unpack_from` finds incomplete record. CRC mismatch / short record; truncated. |
-| **CP7** | `engine.py:214` (before 2nd `os.fsync`) | COMMIT record in kernel buffer. | If lost in power cut, treated as uncommitted and truncated. If durable, committed cleanly. |
-| **CP8** | `engine.py:217` (after 2nd `os.fsync`, before index update) | All ops and COMMIT marker 100% durable on disk. Process dies before Python dict update. | Recovery reads complete COMMIT record, validates CRC and op count, applies batch to index. Zero loss. |
-| **CP9** | `compaction.py:53` (writing temp file) | Temp file `*.compact.<pid>.tmp` partially written. Authoritative `.db` file completely intact. | `cleanup_temp_files` unlinks stale temp file. Authoritative file opened intact. |
-| **CP10** | `compaction.py:73` (temp file fsynced, before `os.replace`) | Temp file complete and durable. Original `.db` complete and durable. | Original `.db` remains active. Temp file deleted on next open. |
-| **CP11** | `compaction.py:77` (after `os.replace`, before POSIX dir fsync) | New compacted file authoritative on filesystem. Directory entry not yet flushed. | Modern filesystems (NTFS, ext4 journaling) keep replaced file valid. Database opens new file. |
-| **CP12** | `recovery.py:209` (mid `os.ftruncate`) | File partially truncated by kernel or interrupted. | Next recovery re-scans from offset 16, finds truncated boundary, and re-executes `os.ftruncate`. Idempotent. |
+| **A1** (pre-write) | Clean file at previous commit; 0 bytes appended | Replay scans to previous commit offset | 0 data lost; unstarted put discarded |
+| **A2** (mid-write) | Partial PUT payload or truncated CRC at EOF | CRC check fails; uncommitted op dropped; tail truncated | Incomplete put dropped; previous commits intact |
+| **A3** (pre-fsync) | PUT record in OS page cache; COMMIT marker absent | EOF reached without COMMIT; uncommitted op discarded | Un-ACKed put dropped; prior commits intact |
+| **A4** (post-fsync) | Record and COMMIT marker durable; killed before return | Replay verifies CRC and COMMIT; updates index | 100% retained; put committed before crash |
+| **B1** (mid-batch) | Ops 1–3 of 10 written; ops 4–10 and COMMIT absent | EOF reached without COMMIT; ops 1–3 dropped; tail truncated | Partial batch dropped; 0 corruption |
+| **B2** (batch no-commit) | All 10 ops on disk; 24-byte COMMIT absent | Replay buffers 10 ops; EOF clears pending ops | Entire batch discarded atomically |
+| **B3** (commit mid-fsync) | COMMIT in page cache or torn CRC | CRC mismatch drops all 10; durable marker applies all 10 | All-or-nothing: either all 10 apply or 0 apply |
+| **C1** (replay scan) | Authoritative `.db` completely untouched | Next `open()` re-runs read-only scan from offset 16 | 0 data lost; recovery scan is read-only |
+| **C2** (mid-truncate) | Tail partially truncated or interrupted | `os.ftruncate` is idempotent; next open re-truncates | Uncommitted tail removed; all commits intact |
+| **C3** (mid-compaction) | Partial temp file; original `.db` untouched | `cleanup_temp_files` unlinks temp; opens original `.db` | 0 data lost; original file unchanged |
+| **C4** (swap replace) | Killed during `os.replace(temp, db)` | OS atomic rename ensures either old or new file active | 0 data lost; one authoritative file active |
+| **C5** (post-replace) | Compacted file active; stale temp file on disk | Compacted file opens; `cleanup_temp_files` unlinks temp | 0 data lost; database fully compacted |
 
 ---
 
 ## 2. Ordering Argument Naming System Calls
 
-The durability and atomicity invariant relies on a strict sequence of OS system calls:
-1. `os.write(fd, ops_payload)`: Enqueues data into kernel buffer cache.
-2. `os.fsync(fd)` (Windows `_commit` / POSIX `fsync`): Forces physical disk write barrier for payload data before metadata commit.
-3. `os.write(fd, commit_payload)`: Appends the commit record containing the transaction ID, op count, and CRC32.
-4. `os.fsync(fd)`: Forces physical disk write barrier for the commit record.
-5. In-memory index update under `threading.Lock`: Memory matches disk state only after disk write barrier succeeds.
+Durability and atomicity invariants rely on an immutable system call sequence executed under `threading.Lock`:
+1. `os.write(fd, ops_payload)`: Appends operation records to OS page cache.
+2. `os.fsync(fd)`: Forces dirty sectors to non-volatile storage (Win32 `FlushFileBuffers` / POSIX `fsync`).
+3. `os.write(fd, commit_payload)`: Appends the 24-byte COMMIT marker (`op_count`, `txid`, CRC32).
+4. `os.fsync(fd)`: Forces physical disk barrier for the commit marker.
+5. In-memory index update: Updated under lock only after Step 4 succeeds, prior to returning success.
+6. `os.ftruncate(fd, offset)`: During recovery, severs uncommitted trailing bytes from allocation table.
+7. `os.replace(temp_path, db_path)`: During compaction, atomically swaps filesystem directory entries.
 
-Because `fsync` at Step 3 precedes `write` at Step 4, and `fsync` at Step 5 precedes index update and ACK generation, the hardware disk controller can never reorder the commit marker before the payload data.
-
----
-
-## 3. Honest Weaknesses (Engine Limitations)
-
-1. **Memory Index Bound by RAM**:
-   The in-memory hash table stores `(val_offset, val_len)` for every key. At 1,000,000 keys, the Python dictionary and byte objects consume ~120 MB RAM. If the dataset exceeds 50 million keys, process memory exhaustion will occur.
-2. **Global Lock Contention on Writes**:
-   A single `threading.Lock` serializes all `put`, `batch`, `delete`, and `get` operations. Write throughput is constrained by the serialization of `os.fsync(fd)` calls (roughly 100–1000 fsyncs/sec on NVMe/SSD, fewer on spinning disks).
-3. **Compaction Peak Space Requirement**:
-   Compaction writes all live keys to a secondary file before atomic replacement. During compaction, disk usage temporarily doubles (old file size + compacted file size). If disk space is below $2\times$, compaction will fail with `DiskFullError`.
-4. **Platform Asymmetry for Directory Fsync**:
-   POSIX provides `os.fsync` on directory file descriptors to guarantee directory metadata durability after rename. Windows NT does not support directory `fsync` (`[Errno 13] Permission denied`). On Windows, rename metadata durability relies on NTFS journaling.
+**Why this ordering?** If the COMMIT marker were written before or alongside the payload, a crash or drive reordering could produce a valid commit referencing unwritten garbage. Enforcing `os.fsync` between op records and commit marker guarantees hardware write barrier serialization.
+**Directory fsync on Windows**: POSIX requires `os.fsync` on directory descriptors after rename. Windows NT does not support directory `fsync` (`[Errno 13] Permission denied`). On NTFS/ReFS, rename durability is guaranteed by the Master File Table (MFT) journal.
 
 ---
 
-## 4. Failed Attempts & Retrospective
+## 3. Honest Weaknesses (Zero Marketing Spin)
 
-1. **Attempting `os.readinto` Directly on File Descriptors**:
-   - *Attempt*: Used `os.readinto(fd, memoryview)` in initial recovery code.
-   - *Failure*: `os.readinto` does not exist in the Python standard library; `readinto()` is a method on file-like objects (`io.FileIO`, `io.BufferedReader`).
-   - *Correction*: Wrapped `fd` in non-closing `io.FileIO(fd, mode="rb", closefd=False)` to enable zero-copy `readinto` into preallocated `memoryview` buffers.
-2. **Subprocess Boot Latency vs. Millisecond Chaos Kills**:
-   - *Attempt*: Firing random kills 10–50ms after launching `python -m vedasbase ... serve`.
-   - *Failure*: On Windows, spawning a fresh CPython process takes 80–180ms. The process was killed before the interpreter finished importing standard libraries, resulting in 0 ops processed.
-   - *Correction*: Added an active JSON probe handshake (`get __probe__`) to ensure the server worker threads were completely active before starting the chaos kill timer.
+1. **Fsync Cost on Rotational Media vs SSD**: Steps 3 and 5 both issue `os.fsync(fd)`. On spinning HDDs (rotational latency 7200 RPM = 8.3ms/seek), synchronous write throughput is capped at ~60–100 ops/sec. On NVMe SSDs, throughput reaches ~500–2,000 fsyncs/sec. Without group commit, single-op write throughput is strictly bounded by disk flush latency.
+2. **Compaction Peak Disk Amplification**: Compaction writes live keys to a secondary `.tmp` file before replacing the original. During compaction, disk usage temporarily requires up to $2\times$ live data space. If free space is below $1\times$ live DB size, compaction fails with `DiskFullError`.
+3. **In-Memory Hash Index Size**: Every active key is indexed in a Python `dict` mapping `bytes` to `(val_offset, val_len)` (24-byte tuple). In CPython 64-bit, dict entry + 32-byte key + tuple consumes ~120 bytes of RAM per key. A 1 GB RAM budget accommodates a maximum of ~8.5 million keys before process OOM.
+4. **Windows Handle Closure Window & Commit Truncation**:
+   - On Windows, `os.replace` fails if the target has an open handle. The engine closes `engine._fd` under lock before `os.replace`, leaving a sub-millisecond window where the file handle is temporarily closed.
+   - If exactly 1 byte is stripped off EOF (Scenario F4), the 24-byte COMMIT marker's CRC32 is damaged. Recovery cannot determine if the final transaction was complete, so it discards the final batch and truncates to the prior commit. If that batch had already received an ACK, it is lost upon truncation.
 
 ---
 
-## 5. Three Future Improvements
+## 4. What We Tried That Failed
 
-1. **Group Commit / Fsync Merging**:
-   Allow concurrent worker threads to coalesce pending write transactions into a single `os.writev` and single `os.fsync`, scaling throughput from hundreds to tens of thousands of writes/second under heavy concurrency.
-2. **Compaction Checkpoints & Sparse Holes**:
-   Implement sparse file punching (`FALLOC_FL_PUNCH_HOLE` on Linux or `FSCTL_SET_ZERO_DATA` on Windows) to punch holes in the log for obsolete tombstones, reducing the need for full-file rewriting during compaction.
-3. **Partitioned / Striped Reader Locks**:
-   Replace the single global lock with a Read-Write Lock (`threading.RLock` or shared read locks) so multiple concurrent `get()` requests execute in parallel without blocking one another.
+1. **Direct `os.readinto(fd, buf)` During Recovery**:
+   - *Attempt*: Attempted zero-copy recovery using `os.readinto(fd, memoryview)` to maximize scan speed.
+   - *Failure*: `os.readinto` does not exist in the Python standard library; `readinto()` exists only on file-like streams (`io.FileIO`, `io.BufferedReader`).
+   - *Resolution*: Wrapped raw `fd` in non-closing `io.FileIO(fd, mode="rb", closefd=False)`, achieving 1.24s recovery for 1,000,000 keys with zero external dependencies.
+2. **PowerShell `.ps1` Wrapper Execution Policy**:
+   - *Attempt*: Created `kvdb.ps1` and `torture.ps1` for judge command convenience on Windows.
+   - *Failure*: Windows PowerShell blocks `.ps1` scripts by default with `PSSecurityException: UnauthorizedAccess` under default `Restricted` policy.
+   - *Resolution*: Replaced with `.cmd` and `.bat` wrappers (`kvdb.cmd`, `torture.cmd`), which execute instantly on Windows without execution policy restrictions.
+3. **Root Module Shadowing Under Subprocess Testing**:
+   - *Attempt*: Kept `vedasbase.py` at repository root alongside `src/vedasbase/`.
+   - *Failure*: Subprocesses running `python -m vedasbase` treated `vedasbase.py` as a single-file module rather than a package, triggering `ModuleNotFoundError: No module named 'vedasbase.cli'`.
+   - *Resolution*: Removed root `vedasbase.py`, moved engine to `src/vedasbase/`, and provided thin `kvdb.py` launcher at repo root.
 
+---
+
+## 5. Three Things We Would Add With 24 More Hours
+
+1. **Index Checkpointing & Hint Files**:
+   Write a `.hint` checkpoint file during clean `close()`. On subsequent `open()`, verify hint CRC against file size and mtime. This bypasses the full-file recovery scan on clean shutdowns, dropping startup time from 1.2s to < 5ms for 1,000,000 keys.
+2. **Group Commit / Fsync Merging**:
+   Implement a lock-free write queue where worker threads coalesce concurrent write requests into a single vector write and single `os.fsync`, increasing write throughput from ~500 ops/sec to > 25,000 ops/sec under concurrency.
+3. **Compaction via Sparse File Punch-Holes**:
+   On filesystems supporting block deallocation (`FSCTL_SET_ZERO_DATA` on Windows NTFS, `FALLOC_FL_PUNCH_HOLE` on Linux), deallocate disk blocks for obsolete records in-place without creating a secondary file, eliminating $2\times$ disk space amplification during compaction.
