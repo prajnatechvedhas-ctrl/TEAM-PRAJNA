@@ -57,9 +57,7 @@ class VedasDB:
         self._file_lock.acquire()
         try:
             # Open or create database file with binary mode
-            flags = os.O_CREAT | os.O_RDWR
-            if hasattr(os, "O_BINARY"):
-                flags |= os.O_BINARY
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
             self._fd = os.open(self._path, flags, 0o644)
 
             # Run crash recovery and index rebuild
@@ -157,10 +155,21 @@ class VedasDB:
         with self._lock:
             self._ensure_open()
 
-            # Fault injection hook: ACK before fsync/write
-            corrupt_ack_early = os.environ.get("VEDAS_CORRUPT_ACK_EARLY") == "1"
-            skip_commit_marker = os.environ.get("VEDAS_SKIP_COMMIT_MARKER") == "1"
-            skip_commit_fsync = os.environ.get("VEDAS_SKIP_COMMIT_FSYNC") == "1"
+            # Fault injection hooks
+            vedas_bug = os.environ.get("VEDAS_BUG", "").lower()
+            corrupt_ack_early = (
+                os.environ.get("VEDAS_CORRUPT_ACK_EARLY") == "1"
+                or vedas_bug == "ack_before_fsync"
+            )
+            skip_commit_marker = (
+                os.environ.get("VEDAS_SKIP_COMMIT_MARKER") == "1"
+                or vedas_bug in ("skip_commit", "apply_uncommitted")
+            )
+            skip_commit_fsync = (
+                os.environ.get("VEDAS_SKIP_COMMIT_FSYNC") == "1"
+                or vedas_bug == "skip_commit_fsync"
+            )
+            apply_uncommitted = (vedas_bug == "apply_uncommitted")
 
             # -------------------------------------------------------------
             # EXACT 7-STEP WRITE ORDERING UNDER GLOBAL LOCK

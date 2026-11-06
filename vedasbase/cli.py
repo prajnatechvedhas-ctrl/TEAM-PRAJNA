@@ -57,14 +57,15 @@ def serve_loop(db: VedasDB, num_workers: int = 4):
                 break
 
             op_id, cmd, payload = item
-            corrupt_early = os.environ.get("VEDAS_CORRUPT_ACK_EARLY") == "1"
+            vedas_bug = os.environ.get("VEDAS_BUG", "").lower()
+            corrupt_early = os.environ.get("VEDAS_CORRUPT_ACK_EARLY") == "1" or vedas_bug == "ack_before_fsync"
 
             try:
                 if corrupt_early and cmd in ("put", "del", "delete", "batch", "compact"):
                     # Deliberately broken variant: ACK before writing and fsyncing to disk!
                     with stdout_lock:
-                        sys.stdout.write(f"ACK {op_id}\n")
-                        sys.stdout.flush()
+                        sys.stdout.buffer.write(f"ACK {op_id}\n".encode("ascii"))
+                        sys.stdout.buffer.flush()
 
                 if cmd == "put":
                     k = decode_payload(payload, "key", "key_b64", "key_hex")
@@ -72,26 +73,26 @@ def serve_loop(db: VedasDB, num_workers: int = 4):
                     db.put(k, v)
                     if not corrupt_early:
                         with stdout_lock:
-                            sys.stdout.write(f"ACK {op_id}\n")
-                            sys.stdout.flush()
+                            sys.stdout.buffer.write(f"ACK {op_id}\n".encode("ascii"))
+                            sys.stdout.buffer.flush()
 
                 elif cmd in ("del", "delete"):
                     k = decode_payload(payload, "key", "key_b64", "key_hex")
                     db.delete(k)
                     if not corrupt_early:
                         with stdout_lock:
-                            sys.stdout.write(f"ACK {op_id}\n")
-                            sys.stdout.flush()
+                            sys.stdout.buffer.write(f"ACK {op_id}\n".encode("ascii"))
+                            sys.stdout.buffer.flush()
 
                 elif cmd == "get":
                     k = decode_payload(payload, "key", "key_b64", "key_hex")
                     val = db.get(k)
                     with stdout_lock:
                         if val is None:
-                            sys.stdout.write(f"NOT_FOUND {op_id}\n")
+                            sys.stdout.buffer.write(f"NOT_FOUND {op_id}\n".encode("ascii"))
                         else:
-                            sys.stdout.write(f"VAL {op_id} {val.hex()}\n")
-                        sys.stdout.flush()
+                            sys.stdout.buffer.write(f"VAL {op_id} {val.hex()}\n".encode("ascii"))
+                        sys.stdout.buffer.flush()
 
                 elif cmd == "batch":
                     ops_in = payload.get("ops", [])
@@ -107,26 +108,26 @@ def serve_loop(db: VedasDB, num_workers: int = 4):
                     db.batch(norm_ops)
                     if not corrupt_early:
                         with stdout_lock:
-                            sys.stdout.write(f"ACK {op_id}\n")
-                            sys.stdout.flush()
+                            sys.stdout.buffer.write(f"ACK {op_id}\n".encode("ascii"))
+                            sys.stdout.buffer.flush()
 
                 elif cmd == "compact":
                     db.compact()
                     if not corrupt_early:
                         with stdout_lock:
-                            sys.stdout.write(f"ACK {op_id}\n")
-                            sys.stdout.flush()
+                            sys.stdout.buffer.write(f"ACK {op_id}\n".encode("ascii"))
+                            sys.stdout.buffer.flush()
 
                 else:
                     with stdout_lock:
-                        sys.stdout.write(f"ERR {op_id} Unknown command '{cmd}'\n")
-                        sys.stdout.flush()
+                        sys.stdout.buffer.write(f"ERR {op_id} Unknown command '{cmd}'\n".encode("utf-8"))
+                        sys.stdout.buffer.flush()
 
             except Exception as e:
                 with stdout_lock:
                     err_msg = str(e).replace("\n", " ")
-                    sys.stdout.write(f"ERR {op_id} {err_msg}\n")
-                    sys.stdout.flush()
+                    sys.stdout.buffer.write(f"ERR {op_id} {err_msg}\n".encode("utf-8"))
+                    sys.stdout.buffer.flush()
             finally:
                 work_queue.task_done()
 
@@ -137,16 +138,18 @@ def serve_loop(db: VedasDB, num_workers: int = 4):
         threads.append(t)
 
     try:
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
+        # Use binary input buffer on Windows to avoid newline translation
+        for raw_line in sys.stdin.buffer:
+            raw_line = raw_line.strip()
+            if not raw_line:
                 continue
             try:
-                data = json.loads(line)
+                line_str = raw_line.decode("utf-8")
+                data = json.loads(line_str)
             except Exception as e:
                 with stdout_lock:
-                    sys.stdout.write(f"ERR unknown Invalid JSON: {e}\n")
-                    sys.stdout.flush()
+                    sys.stdout.buffer.write(f"ERR unknown Invalid JSON: {e}\n".encode("utf-8"))
+                    sys.stdout.buffer.flush()
                 continue
 
             op_id = data.get("op_id", "0")

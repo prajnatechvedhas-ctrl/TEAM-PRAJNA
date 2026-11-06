@@ -121,5 +121,38 @@ Every write operation strictly executes 7 steps under a single global lock:
 ```
 An ACK is **never** emitted before Step 5 is durable on disk. Readers execute under the same lock, so no client can observe a half-applied transaction.
 
-﻿# VEDAS BASE - Database Project
+### Windows PowerShell Execution Examples
+
+```powershell
+# 1. Open database and print status
+.\.venv\Scripts\python.exe vedasbase.py --db test.db open
+
+# 2. Insert key-value pairs
+.\.venv\Scripts\python.exe vedasbase.py --db test.db put alpha "Hello Vedas"
+.\.venv\Scripts\python.exe vedasbase.py --db test.db put --hex 01020304 deadbeef
+
+# 3. Retrieve key
+.\.venv\Scripts\python.exe vedasbase.py --db test.db get alpha
+
+# 4. Delete key
+.\.venv\Scripts\python.exe vedasbase.py --db test.db del alpha
+
+# 5. Execute atomic batch of operations
+.\.venv\Scripts\python.exe vedasbase.py --db test.db batch '[{"type": "put", "key": "k1", "val": "v1"}, {"type": "del", "key": "k1"}, {"type": "put", "key": "k2", "val": "v2"}]'
+
+# 6. Dump all live keys sorted lexicographically
+.\.venv\Scripts\python.exe vedasbase.py --db test.db dump
+
+# 7. Check database integrity
+.\.venv\Scripts\python.exe vedasbase.py --db test.db check
+
+# 8. Reclaim disk space via online compaction
+.\.venv\Scripts\python.exe vedasbase.py --db test.db compact
+
+# 9. Run server mode on stdin/stdout with 4 worker threads
+.\.venv\Scripts\python.exe vedasbase.py --db test.db serve --workers 4
+
+# 10. Run 200 crash iterations with torture tool
+.\.venv\Scripts\python.exe torture.py --iterations 200 --seed 42
+```
 

@@ -166,6 +166,112 @@ class TestVedasEngine(unittest.TestCase):
         self.assertEqual(dumped, [(b"a", b"2"), (b"m", b"3"), (b"z", b"1")])
         db.close()
 
+    def test_process_lock_released_on_sigkill(self):
+        import subprocess, sys, time
+        # Spawn child process that opens the DB and holds the lock
+        code = f"""
+import sys, time
+from vedasbase import open as vopen
+db = vopen(r"{self.db_path}")
+sys.stdout.write("LOCKED\\n")
+sys.stdout.flush()
+time.sleep(30)
+"""
+        proc = subprocess.Popen([sys.executable, "-u", "-c", code], stdout=subprocess.PIPE, text=True)
+        try:
+            line = proc.stdout.readline().strip()
+            self.assertEqual(line, "LOCKED")
+
+            # Parent cannot open while child holds lock
+            with self.assertRaises(LockError):
+                vedas_open(self.db_path)
+
+            # Hard kill child process (TerminateProcess / SIGKILL)
+            proc.kill()
+            proc.wait(timeout=2)
+            if proc.stdout:
+                proc.stdout.close()
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        # Windows NT kernel handle cleanup is asynchronous after TerminateProcess.
+        # Retry with brief sleep (up to 1s) until kernel releases the handle lock.
+        db = None
+        for _ in range(50):
+            try:
+                db = vedas_open(self.db_path)
+                break
+            except LockError:
+                time.sleep(0.02)
+
+        self.assertIsNotNone(db, "Lock was not automatically released after child process killed")
+        db.put(b"after_kill", b"alive")
+        self.assertEqual(db.get(b"after_kill"), b"alive")
+        db.close()
+
+    def test_compaction_txid_continuity(self):
+        db = vedas_open(self.db_path)
+        for i in range(15):
+            db.put(f"k_{i}".encode(), f"v_{i}".encode())
+        txid_before_compact = db._next_txid
+        self.assertGreaterEqual(txid_before_compact, 15)
+
+        db.compact()
+        txid_after_compact = db._next_txid
+        # Compaction must NOT reset txid to 1; must be monotonically increasing
+        self.assertGreater(txid_after_compact, txid_before_compact)
+        db.close()
+
+    def test_zero_length_values_and_key_limits(self):
+        db = vedas_open(self.db_path, max_bytes=10 * 1024 * 1024)
+        # 1-byte key
+        db.put(b"k", b"val_1b")
+        self.assertEqual(db.get(b"k"), b"val_1b")
+
+        # 1024-byte key (exact maximum)
+        max_key = b"K" * 1024
+        db.put(max_key, b"max_key_val")
+        self.assertEqual(db.get(max_key), b"max_key_val")
+
+        # 0-byte value
+        db.put(b"zero_val_key", b"")
+        self.assertEqual(db.get(b"zero_val_key"), b"")
+
+        # Delete non-existent key succeeds without error
+        db.delete(b"non_existent_key_xyz")
+        self.assertIsNone(db.get(b"non_existent_key_xyz"))
+
+        # Reject key of 1025 bytes
+        with self.assertRaises(InvalidInputError):
+            db.put(b"K" * 1025, b"val")
+
+        # Reject key of 0 bytes
+        with self.assertRaises(InvalidInputError):
+            db.put(b"", b"val")
+
+        db.close()
+
+    def test_duplicate_keys_within_batch(self):
+        db = vedas_open(self.db_path)
+        # B5 rule: last op wins. Put then Del -> key deleted.
+        db.batch([
+            ("put", b"dup_key_1", b"v1"),
+            ("del", b"dup_key_1"),
+        ])
+        self.assertIsNone(db.get(b"dup_key_1"))
+
+        # Del then Put -> key has new value.
+        db.batch([
+            ("del", b"dup_key_2"),
+            ("put", b"dup_key_2", b"final_value"),
+        ])
+        self.assertEqual(db.get(b"dup_key_2"), b"final_value")
+        db.close()
+
 if __name__ == "__main__":
     unittest.main()
 

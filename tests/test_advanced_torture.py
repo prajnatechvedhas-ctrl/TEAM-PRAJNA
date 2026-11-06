@@ -540,13 +540,13 @@ class TestAdvancedTorture(unittest.TestCase):
             f.write(data)
 
         check_a = check_db_integrity(db_path_a)
+        self.assertEqual(check_a["status"], "CORRUPTED")
         self.assertFalse(check_a["clean"], "Failed to detect payload bit-flip: reported clean")
         self.assertGreater(check_a["uncommitted_bytes"], 0, "Failed to flag uncommitted/corrupted bytes")
 
-        # open() must truncate at the last valid commit prior to corruption
-        db_a_rep = vedas_open(db_path_a)
-        self.assertIsNone(db_a_rep.get(b"secure_key_1"), "Corrupted key returned from recovered DB")
-        db_a_rep.close()
+        # open() must detect mid-file corruption and raise CorruptionError to protect valid data
+        with self.assertRaises(CorruptionError):
+            vedas_open(db_path_a)
 
         # Scenario B: Corrupted File Header Magic
         db_path_b = self._get_temp_db_path("corrupt_header.db")

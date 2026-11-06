@@ -24,10 +24,7 @@ class FileLock:
 
     def acquire(self):
         """Acquires the lock or raises LockError."""
-        flags = os.O_CREAT | os.O_RDWR
-        if hasattr(os, "O_BINARY"):
-            flags |= os.O_BINARY
-        
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
         try:
             self._fd = os.open(self.lock_path, flags, 0o644)
         except OSError as e:

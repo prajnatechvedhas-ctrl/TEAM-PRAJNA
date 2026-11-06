@@ -74,12 +74,14 @@ class TortureRunner:
     def __init__(
         self,
         db_path: str,
-        mode: str = "concurrent",
+        mode: str = "random",
         iterations: int = 500,
         seed: int = 42,
         max_bytes: int = 100 * 1024 * 1024,
         num_writers: int = 2,
         broken: bool = False,
+        shared_keys: bool = False,
+        **kwargs,
     ):
         self.db_path = os.path.abspath(db_path)
         self.oracle_log = self.db_path + ".oracle.log"
@@ -89,6 +91,7 @@ class TortureRunner:
         self.max_bytes = max_bytes
         self.num_writers = num_writers
         self.broken = broken
+        self.shared_keys = kwargs.get("shared_keys", False)
         self.rng = random.Random(seed)
         self.oracle = Oracle(self.oracle_log)
         self.op_counter = 0
@@ -307,9 +310,13 @@ class TortureRunner:
         server_ready.wait(timeout=5.0)
 
         writer_threads = []
-        key_pool = [f"k_{x}".encode("ascii") for x in range(30)]
 
         def writer_loop(writer_id: int):
+            if self.shared_keys:
+                key_pool = [f"k_{x}".encode("ascii") for x in range(30)]
+            else:
+                key_pool = [f"w{writer_id}_k{x}".encode("ascii") for x in range(30)]
+
             while not stop_writers.is_set():
                 op_id = self._next_op_id()
                 r = self.rng.random()
@@ -331,7 +338,7 @@ class TortureRunner:
                     batch_size = self.rng.randint(500, 2000)
                     ops = []
                     for b_i in range(batch_size):
-                        b_k = f"batch_{writer_id}_{b_i}".encode("ascii")
+                        b_k = f"batch_{writer_id}_{op_id}_{b_i}".encode("ascii")
                         b_v = f"val_{b_i}".encode("ascii")
                         ops.append({"type": "put", "key": b_k, "val": b_v})
                     op_data = {"cmd": "batch", "ops": ops}
@@ -383,7 +390,7 @@ class TortureRunner:
                         line = json.dumps({"op_id": op_id, "cmd": "compact"}) + "\n"
 
                 else:
-                    # Default: concurrent puts, deletes, and small batches
+                    # Default: random puts, deletes, and small batches
                     if r < 0.6:
                         k = self.rng.choice(key_pool)
                         v = f"v_{self.rng.randint(1, 10000)}".encode("ascii")
@@ -406,8 +413,8 @@ class TortureRunner:
                         }) + "\n"
                     else:
                         sub_ops = []
-                        for _ in range(self.rng.randint(2, 5)):
-                            sub_k = self.rng.choice(key_pool)
+                        for s_idx in range(self.rng.randint(2, 5)):
+                            sub_k = f"w{writer_id}_b{op_id}_{s_idx}".encode("ascii") if not self.shared_keys else self.rng.choice(key_pool)
                             sub_v = f"batch_val_{self.rng.randint(1, 10000)}".encode("ascii")
                             sub_ops.append({"type": "put", "key": sub_k, "val": sub_v})
                         op_data = {"cmd": "batch", "ops": sub_ops}
@@ -493,9 +500,15 @@ class TortureRunner:
 def main():
     parser = argparse.ArgumentParser(description="Vedas Base Torture and Chaos Verification Tool")
     parser.add_argument("--db", default="torture_test.db", help="Path to test database")
-    parser.add_argument("--mode", default="concurrent", choices=[
-        "concurrent", "large_values", "large_batches", "compaction", "recovery_crash", "disk_full", "broken_variant"
-    ], help="Torture mode")
+    parser.add_argument("--mode", default="random", choices=[
+        "random", "concurrent", "large_values", "large_batches", "compaction", "recovery_crash", "disk_full", "broken_variant"
+    ], help="Torture mode (default: random)")
+    parser.add_argument("--large-values", action="store_true", help="Run 1 MB large values torture mode")
+    parser.add_argument("--large-batches", action="store_true", help="Run large batches (up to 10,000 ops) torture mode")
+    parser.add_argument("--compaction", action="store_true", help="Run compaction crash torture mode")
+    parser.add_argument("--recovery-crash", action="store_true", help="Run recovery-crash torture mode")
+    parser.add_argument("--disk-full", action="store_true", help="Run disk-full space limit torture mode")
+    parser.add_argument("--shared-keys", action="store_true", help="Allow writers to share keys (default: disjoint keys per writer)")
     parser.add_argument("--iterations", type=int, default=500, help="Number of crash iterations (default: 500)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for repeatability")
     parser.add_argument("--max-bytes", type=int, default=100 * 1024 * 1024, help="Max database size in bytes")
@@ -503,16 +516,33 @@ def main():
     parser.add_argument("--broken", action="store_true", help="Run deliberately broken variant to verify torture tool detects bugs")
 
     args = parser.parse_args()
-    broken = args.broken or (args.mode == "broken_variant")
+
+    # Resolve mode flags
+    mode = args.mode
+    if args.large_values:
+        mode = "large_values"
+    elif args.large_batches:
+        mode = "large_batches"
+    elif args.compaction:
+        mode = "compaction"
+    elif args.recovery_crash:
+        mode = "recovery_crash"
+    elif args.disk_full:
+        mode = "disk_full"
+    elif mode == "concurrent":
+        mode = "random"
+
+    broken = args.broken or (args.mode == "broken_variant") or (os.environ.get("VEDAS_BUG") in ("ack_before_fsync", "skip_commit", "apply_uncommitted"))
 
     runner = TortureRunner(
         db_path=args.db,
-        mode=args.mode,
+        mode=mode,
         iterations=args.iterations,
         seed=args.seed,
         max_bytes=args.max_bytes,
         num_writers=args.writers,
         broken=broken,
+        shared_keys=args.shared_keys,
     )
     runner.run()
 

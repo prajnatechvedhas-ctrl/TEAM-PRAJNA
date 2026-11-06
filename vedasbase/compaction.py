@@ -53,9 +53,7 @@ def run_compaction(engine) -> int:
             f"Compaction requires {total_needed} bytes, which exceeds max_bytes limit {engine._max_bytes}"
         )
 
-    flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
-    if hasattr(os, "O_BINARY"):
-        flags |= os.O_BINARY
+    flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, "O_BINARY", 0)
 
     temp_fd = None
     try:
@@ -65,9 +63,10 @@ def run_compaction(engine) -> int:
         os.write(temp_fd, encode_file_header())
 
         # Step 3: Stream live key/value pairs
+        # Maintain txid continuity: compacted batch inherits engine._next_txid
         new_index: Dict[bytes, Tuple[int, int]] = {}
         cur_offset = FILE_HEADER_SIZE
-        txid = 1
+        txid = engine._next_txid
 
         for k, (val_off, val_len) in engine._index.items():
             # Read value from source database file
@@ -104,9 +103,7 @@ def run_compaction(engine) -> int:
         fsync_directory_if_supported(dir_name)
 
         # Step 9: Re-open db_path in read/write mode
-        rw_flags = os.O_RDWR
-        if hasattr(os, "O_BINARY"):
-            rw_flags |= os.O_BINARY
+        rw_flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
         engine._fd = os.open(db_path, rw_flags, 0o644)
 
         # Step 10: Commit state update
@@ -130,9 +127,7 @@ def run_compaction(engine) -> int:
             except OSError:
                 pass
         if engine._fd is None:
-            rw_flags = os.O_RDWR
-            if hasattr(os, "O_BINARY"):
-                rw_flags |= os.O_BINARY
+            rw_flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
             engine._fd = os.open(db_path, rw_flags, 0o644)
             os.lseek(engine._fd, engine._last_committed_offset, os.SEEK_SET)
         raise
