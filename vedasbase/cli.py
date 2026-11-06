@@ -165,49 +165,59 @@ def serve_loop(db: VedasDB, num_workers: int = 4):
             t.join()
 
 def main(args: List[str] = None):
-    parser = argparse.ArgumentParser(description="Vedas Base Embedded Key-Value Database CLI")
-    parser.add_argument("--db", required=True, help="Path to database data file")
-    parser.add_argument("--max-bytes", type=int, default=10 * 1024 * 1024 * 1024, help="Max database size in bytes")
+    # Common options parent parser so --db can appear before OR after subcommand
+    parent_parser = argparse.ArgumentParser(add_help=False)
+    parent_parser.add_argument("--db", default=argparse.SUPPRESS, help="Path to database data file")
+    parent_parser.add_argument("--max-bytes", type=int, default=10 * 1024 * 1024 * 1024, help="Max database size in bytes")
+
+    parser = argparse.ArgumentParser(
+        description="Vedas Base Embedded Key-Value Database CLI",
+        parents=[parent_parser],
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Subcommand: open
-    subparsers.add_parser("open", help="Open/recover database file and check status")
+    subparsers.add_parser("open", parents=[parent_parser], help="Open/recover database file and check status")
 
     # Subcommand: put
-    p_put = subparsers.add_parser("put", help="Insert or update a key-value pair")
+    p_put = subparsers.add_parser("put", parents=[parent_parser], help="Insert or update a key-value pair")
     p_put.add_argument("key", help="Key string (or hex if --hex)")
     p_put.add_argument("value", help="Value string (or hex if --hex)")
     p_put.add_argument("--hex", action="store_true", help="Treat key and value as hex strings")
 
     # Subcommand: get
-    p_get = subparsers.add_parser("get", help="Retrieve value for a key")
+    p_get = subparsers.add_parser("get", parents=[parent_parser], help="Retrieve value for a key")
     p_get.add_argument("key", help="Key string (or hex if --hex)")
     p_get.add_argument("--hex", action="store_true", help="Treat key as hex string")
 
     # Subcommand: del
-    p_del = subparsers.add_parser("del", help="Delete a key")
+    p_del = subparsers.add_parser("del", parents=[parent_parser], help="Delete a key")
     p_del.add_argument("key", help="Key string (or hex if --hex)")
     p_del.add_argument("--hex", action="store_true", help="Treat key as hex string")
 
     # Subcommand: batch
-    p_batch = subparsers.add_parser("batch", help="Execute a JSON batch of operations")
+    p_batch = subparsers.add_parser("batch", parents=[parent_parser], help="Execute a JSON batch of operations")
     p_batch.add_argument("json_ops", nargs="?", help="JSON array of operations")
 
     # Subcommand: dump
-    subparsers.add_parser("dump", help="Dump all live keys and values sorted by key")
+    subparsers.add_parser("dump", parents=[parent_parser], help="Dump all live keys and values sorted by key")
 
     # Subcommand: check
-    subparsers.add_parser("check", help="Validate file integrity and check for corruption")
+    subparsers.add_parser("check", parents=[parent_parser], help="Validate file integrity and check for corruption")
 
     # Subcommand: compact
-    subparsers.add_parser("compact", help="Reclaim disk space by compacting live keys")
+    subparsers.add_parser("compact", parents=[parent_parser], help="Reclaim disk space by compacting live keys")
 
     # Subcommand: serve
-    p_serve = subparsers.add_parser("serve", help="Run database server on stdin/stdout")
+    p_serve = subparsers.add_parser("serve", parents=[parent_parser], help="Run database server on stdin/stdout")
     p_serve.add_argument("--workers", type=int, default=4, help="Number of concurrent writer threads")
 
     parsed = parser.parse_args(args)
+    db_path = getattr(parsed, "db", None)
+    if not db_path:
+        parser.error("The --db <path> argument is required.")
+    parsed.db = db_path
     cmd = parsed.command
 
     if cmd == "check":
