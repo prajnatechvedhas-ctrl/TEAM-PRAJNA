@@ -12,6 +12,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from typing import List
 
 from .engine import open_db, VedasDB
@@ -139,18 +140,41 @@ def serve_loop(db: VedasDB, num_workers: int = 4):
 
     try:
         # Use binary input buffer on Windows to avoid newline translation
+        manual_counter = 0
         for raw_line in sys.stdin.buffer:
             raw_line = raw_line.strip()
             if not raw_line:
                 continue
-            try:
-                line_str = raw_line.decode("utf-8")
-                data = json.loads(line_str)
-            except Exception as e:
-                with stdout_lock:
-                    sys.stdout.buffer.write(f"ERR unknown Invalid JSON: {e}\n".encode("utf-8"))
-                    sys.stdout.buffer.flush()
-                continue
+            line_str = raw_line.decode("utf-8", errors="replace")
+            if line_str.startswith("{"):
+                try:
+                    data = json.loads(line_str)
+                except Exception as e:
+                    with stdout_lock:
+                        sys.stdout.buffer.write(f"ERR unknown Invalid JSON: {e}\n".encode("utf-8"))
+                        sys.stdout.buffer.flush()
+                    continue
+            else:
+                # Text line support: put k v / get k / del k / compact
+                parts = line_str.split(" ", 2)
+                t_cmd = parts[0].lower()
+                manual_counter += 1
+                op_id = f"m{manual_counter}"
+                if t_cmd == "put" and len(parts) >= 3:
+                    data = {"op_id": op_id, "cmd": "put", "key": parts[1], "val": parts[2]}
+                elif t_cmd == "get" and len(parts) >= 2:
+                    data = {"op_id": op_id, "cmd": "get", "key": parts[1]}
+                elif t_cmd in ("del", "delete") and len(parts) >= 2:
+                    data = {"op_id": op_id, "cmd": "del", "key": parts[1]}
+                elif t_cmd == "compact":
+                    data = {"op_id": op_id, "cmd": "compact"}
+                elif t_cmd in ("exit", "quit"):
+                    break
+                else:
+                    with stdout_lock:
+                        sys.stdout.buffer.write(f"ERR {op_id} Unknown command line: {line_str}\n".encode("utf-8"))
+                        sys.stdout.buffer.flush()
+                    continue
 
             op_id = data.get("op_id", "0")
             cmd = data.get("cmd", "").lower()
@@ -167,7 +191,40 @@ def serve_loop(db: VedasDB, num_workers: int = 4):
         for t in threads:
             t.join()
 
+def normalize_cli_args(args: List[str]) -> List[str]:
+    """
+    Normalizes CLI arguments so both forms work interchangeably:
+      ./kvdb <cmd> <path> [args...]
+      ./kvdb --db <path> <cmd> [args...]
+    """
+    if not args:
+        return args
+
+    valid_cmds = {"open", "put", "get", "del", "delete", "batch", "dump", "check", "compact", "serve"}
+
+    # If --db is already in args, leave as is
+    if "--db" in args:
+        return list(args)
+
+    # Find the first argument that is a known subcommand
+    for idx, arg in enumerate(args):
+        if arg in valid_cmds:
+            # Check if the subsequent argument is a database path (doesn't start with '-')
+            if idx + 1 < len(args) and not args[idx + 1].startswith("-"):
+                db_path = args[idx + 1]
+                new_args = list(args)
+                new_args.pop(idx + 1)
+                return ["--db", db_path] + new_args
+            break
+
+    return list(args)
+
 def main(args: List[str] = None):
+    if args is None:
+        args = sys.argv[1:]
+
+    args = normalize_cli_args(args)
+
     # Common options parent parser so --db can appear before OR after subcommand
     parent_parser = argparse.ArgumentParser(add_help=False)
     parent_parser.add_argument("--db", default=argparse.SUPPRESS, help="Path to database data file")
@@ -194,20 +251,22 @@ def main(args: List[str] = None):
     p_get.add_argument("key", help="Key string (or hex if --hex)")
     p_get.add_argument("--hex", action="store_true", help="Treat key as hex string")
 
-    # Subcommand: del
+    # Subcommand: del / delete
     p_del = subparsers.add_parser("del", parents=[parent_parser], help="Delete a key")
     p_del.add_argument("key", help="Key string (or hex if --hex)")
     p_del.add_argument("--hex", action="store_true", help="Treat key as hex string")
 
     # Subcommand: batch
-    p_batch = subparsers.add_parser("batch", parents=[parent_parser], help="Execute a JSON batch of operations")
-    p_batch.add_argument("json_ops", nargs="?", help="JSON array of operations")
+    p_batch = subparsers.add_parser("batch", parents=[parent_parser], help="Execute a batch of operations")
+    p_batch.add_argument("batch_input", nargs="?", default=None, help="File path with 'put k v'/'del k', JSON array, or '-' for stdin")
 
     # Subcommand: dump
-    subparsers.add_parser("dump", parents=[parent_parser], help="Dump all live keys and values sorted by key")
+    p_dump = subparsers.add_parser("dump", parents=[parent_parser], help="Dump all live keys and values sorted by key")
+    p_dump.add_argument("--hex", action="store_true", help="Format keys and values as hex")
 
     # Subcommand: check
-    subparsers.add_parser("check", parents=[parent_parser], help="Validate file integrity and check for corruption")
+    p_check = subparsers.add_parser("check", parents=[parent_parser], help="Validate file integrity and check for corruption")
+    p_check.add_argument("--json", action="store_true", help="Output JSON details")
 
     # Subcommand: compact
     subparsers.add_parser("compact", parents=[parent_parser], help="Reclaim disk space by compacting live keys")
@@ -219,13 +278,19 @@ def main(args: List[str] = None):
     parsed = parser.parse_args(args)
     db_path = getattr(parsed, "db", None)
     if not db_path:
-        parser.error("The --db <path> argument is required.")
+        parser.error("The database <path> or --db <path> argument is required.")
     parsed.db = db_path
     cmd = parsed.command
 
     if cmd == "check":
         res = check_db_integrity(parsed.db)
-        print(json.dumps(res, indent=2))
+        if getattr(parsed, "json", False):
+            print(json.dumps(res, indent=2))
+        else:
+            if res.get("status") == "OK":
+                print("OK")
+            else:
+                sys.stderr.write(f"CORRUPTION: {res.get('reason', 'Integrity check failed')}\n")
         if res.get("status") != "OK":
             sys.exit(1)
         return
@@ -233,16 +298,18 @@ def main(args: List[str] = None):
     if cmd == "dump" and not os.path.exists(parsed.db):
         return
 
-    # For other commands, open the database engine
+    # For other commands, open the database engine (measuring recovery time)
+    t0 = time.perf_counter()
     try:
         db = open_db(parsed.db, max_bytes=parsed.max_bytes)
     except Exception as e:
         sys.stderr.write(f"Error opening database: {e}\n")
         sys.exit(1)
+    recovery_sec = time.perf_counter() - t0
 
     try:
         if cmd == "open":
-            print(f"OK keys={len(db._index)} size={db._last_committed_offset}")
+            print(f"OK keys={len(db._index)} size={db._last_committed_offset} recovery_time={recovery_sec:.4f}s")
 
         elif cmd == "put":
             k = bytes.fromhex(parsed.key) if parsed.hex else parsed.key.encode("utf-8")
@@ -254,7 +321,7 @@ def main(args: List[str] = None):
             k = bytes.fromhex(parsed.key) if parsed.hex else parsed.key.encode("utf-8")
             v = db.get(k)
             if v is None:
-                print("NOT_FOUND")
+                print("NOTFOUND")
                 sys.exit(2)
             else:
                 if parsed.hex:
@@ -265,33 +332,69 @@ def main(args: List[str] = None):
                     except UnicodeDecodeError:
                         print(v.hex())
 
-        elif cmd == "del":
+        elif cmd in ("del", "delete"):
             k = bytes.fromhex(parsed.key) if parsed.hex else parsed.key.encode("utf-8")
             db.delete(k)
             print("OK")
 
         elif cmd == "batch":
-            raw_json = parsed.json_ops
-            if not raw_json:
-                raw_json = sys.stdin.read()
-            ops_data = json.loads(raw_json)
+            raw_input = parsed.batch_input
+            if not raw_input or raw_input == "-":
+                raw_input = sys.stdin.read()
+            elif os.path.isfile(raw_input):
+                with open(raw_input, "r", encoding="utf-8") as f:
+                    raw_input = f.read()
+
+            raw_stripped = raw_input.strip()
             norm_ops = []
-            for op in ops_data:
-                op_t = op.get("type", "put").lower()
-                k = decode_payload(op, "key", "key_b64", "key_hex")
-                if op_t == "put":
-                    v = decode_payload(op, "val", "val_b64", "val_hex")
-                    norm_ops.append(("put", k, v))
-                else:
-                    norm_ops.append(("del", k))
+            if raw_stripped.startswith("[") or raw_stripped.startswith("{"):
+                ops_data = json.loads(raw_stripped)
+                if isinstance(ops_data, dict) and "ops" in ops_data:
+                    ops_data = ops_data["ops"]
+                for op in ops_data:
+                    op_t = op.get("type", op.get("cmd", "put")).lower()
+                    k = decode_payload(op, "key", "key_b64", "key_hex")
+                    if op_t == "put":
+                        v = decode_payload(op, "val", "val_b64", "val_hex")
+                        norm_ops.append(("put", k, v))
+                    else:
+                        norm_ops.append(("del", k))
+            else:
+                # File format with one op per line: "put k v" or "del k"
+                for line in raw_stripped.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split(" ", 2)
+                    op_type = parts[0].lower()
+                    if op_type == "put":
+                        k = parts[1].encode("utf-8")
+                        v = parts[2].encode("utf-8") if len(parts) > 2 else b""
+                        norm_ops.append(("put", k, v))
+                    elif op_type in ("del", "delete"):
+                        k = parts[1].encode("utf-8")
+                        norm_ops.append(("del", k))
+                    else:
+                        raise ValueError(f"Unknown batch op in input: '{line}'")
+
             db.batch(norm_ops)
             print("OK")
 
         elif cmd == "dump":
             pairs = db.dump()
             for k, v in pairs:
-                # Output format: <hex_key> <hex_value>
-                print(f"{k.hex()} {v.hex()}")
+                if getattr(parsed, "hex", False):
+                    print(f"{k.hex()} {v.hex()}")
+                else:
+                    try:
+                        k_str = k.decode("utf-8")
+                        v_str = v.decode("utf-8")
+                        if " " not in k_str and "\n" not in k_str and "\r" not in k_str and "\n" not in v_str and "\r" not in v_str:
+                            print(f"{k_str} {v_str}")
+                        else:
+                            print(f"{k.hex()} {v.hex()}")
+                    except UnicodeDecodeError:
+                        print(f"{k.hex()} {v.hex()}")
 
         elif cmd == "compact":
             new_size = db.compact()

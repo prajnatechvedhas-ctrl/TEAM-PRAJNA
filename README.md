@@ -8,44 +8,58 @@
 ## 1. Quick Start & Execution
 
 ### Run / Build Command (Pure Python Standard Library)
-No compilation or external packages needed:
+No compilation or external packages needed. Uses Python 3.11+ standard library only:
 ```bash
-# Verify environment (Python 3.11+ required)
+# Verify environment
 python --version
 
-# Run CLI directly
-python vedasbase.py --help
-# Or as a module
-python -m vedasbase --help
+# On Windows (PowerShell or Command Prompt):
+.\kvdb open my.db
+.\torture --iterations 200 --seed 42
+
+# On Linux / macOS / Git Bash:
+./kvdb open my.db
+./torture --iterations 200 --seed 42
+
+# Or directly via Python:
+python vedasbase.py open my.db
+python torture.py --iterations 200 --seed 42
 ```
 
 ### Run All Unit & Crash Tests
 ```bash
-python -m unittest discover -s tests
+python -m unittest discover -s tests -v
 ```
 
-### Run Chaos Torture Test (500 Hard Kill Cycles)
+### Run Chaos Torture Test (Judge Demo Commands)
 ```bash
-python torture.py --mode concurrent --iterations 500 --seed 1337
+# Standard 200/500-iteration random kill run
+./torture --iterations 200 --seed 42
+
+# Targeted judge torture modes
+./torture --iterations 100 --seed 999 --mode large-values
+./torture --iterations 100 --seed 7 --mode compaction
+./torture --iterations 100 --seed 42 --mode recovery-crash
+./torture --iterations 100 --seed 123 --mode disk-full
 ```
 
 ---
 
 ## 2. CLI Commands Reference
 
-All commands require `--db <path>` to specify the authoritative data file.
+Supports both `./kvdb <cmd> <path> ...` (positional database path) and `--db <path> <cmd> ...`.
 
 | Command | Usage | Description |
 |---|---|---|
-| `open` | `python vedasbase.py --db my.db open` | Opens database, executes crash recovery, truncates uncommitted tails, and prints key count and size. |
-| `put` | `python vedasbase.py --db my.db put <key> <val>` | Inserts or updates key-value pair as an atomic durable transaction. Supports `--hex`. |
-| `get` | `python vedasbase.py --db my.db get <key>` | Reads value for key. Prints value or `NOT_FOUND`. Supports `--hex`. |
-| `del` | `python vedasbase.py --db my.db del <key>` | Deletes key as an atomic durable transaction. Supports `--hex`. |
-| `batch` | `python vedasbase.py --db my.db batch '[{"type": "put", "key": "a", "val": "1"}]'` | Executes an atomic batch of operations (up to 10,000 ops). Reads from argument or stdin. |
-| `dump` | `python vedasbase.py --db my.db dump` | Outputs all live key-value pairs sorted lexicographically by key formatted as `<hex_key> <hex_val>`. |
-| `check` | `python vedasbase.py --db my.db check` | Read-only integrity check validating every record's CRC32, commit counts, and uncommitted tail size. |
-| `compact` | `python vedasbase.py --db my.db compact` | Reclaims disk space by compacting live keys into a new file using atomic replacement. |
-| `serve` | `python vedasbase.py --db my.db serve --workers 4` | Long-running multi-threaded server communicating over stdin/stdout with atomic `ACK <op-id>` protocol. |
+| `open` | `./kvdb open <path> [--max-bytes N]` | Opens or creates database, runs crash recovery, and prints key count and recovery time. |
+| `put` | `./kvdb put <path> <key> <value>` | Inserts or updates key-value pair as an atomic durable transaction. Supports `--hex`. |
+| `get` | `./kvdb get <path> <key>` | Reads value for key. Prints value, or `NOTFOUND` with exit code 2. Supports `--hex`. |
+| `del` | `./kvdb del <path> <key>` | Deletes key as an atomic durable transaction. Deleting a missing key is not an error. Supports `--hex`. |
+| `batch` | `./kvdb batch <path> <file>` | Applies batch of ops from file (one op per line: `put k v` or `del k`), JSON string, or `-` (stdin). |
+| `dump` | `./kvdb dump <path> [--hex]` | Outputs all live key-value pairs sorted lexicographically by key (`<key> <val>` or hex if binary/`--hex`). |
+| `check` | `./kvdb check <path> [--json]` | Verifies file integrity and CRCs. Prints `OK` (exit 0) or corruption reason to stderr (exit 1). |
+| `compact` | `./kvdb compact <path>` | Reclaims disk space by compacting live keys into a new file using atomic replacement. |
+| `serve` | `./kvdb serve <path> [--workers N]` | Long-running server on stdin/stdout. Processes JSON or text lines; prints `ACK <op-id>` only after durability. |
 
 ---
 

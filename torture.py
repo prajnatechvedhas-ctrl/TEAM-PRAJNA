@@ -119,6 +119,7 @@ class TortureRunner:
             "--db",
             self.db_path,
             "dump",
+            "--hex",
         ]
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if res.returncode != 0:
@@ -144,6 +145,7 @@ class TortureRunner:
             "--db",
             self.db_path,
             "check",
+            "--json",
         ]
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
@@ -500,9 +502,16 @@ class TortureRunner:
 def main():
     parser = argparse.ArgumentParser(description="Vedas Base Torture and Chaos Verification Tool")
     parser.add_argument("--db", default="torture_test.db", help="Path to test database")
-    parser.add_argument("--mode", default="random", choices=[
-        "random", "concurrent", "large_values", "large_batches", "compaction", "recovery_crash", "disk_full", "broken_variant"
-    ], help="Torture mode (default: random)")
+    valid_modes = [
+        "random", "concurrent",
+        "large_values", "large-values",
+        "large_batches", "large-batches",
+        "compaction",
+        "recovery_crash", "recovery-crash",
+        "disk_full", "disk-full",
+        "broken_variant", "broken-variant",
+    ]
+    parser.add_argument("--mode", default="random", choices=valid_modes, help="Torture mode (default: random)")
     parser.add_argument("--large-values", action="store_true", help="Run 1 MB large values torture mode")
     parser.add_argument("--large-batches", action="store_true", help="Run large batches (up to 10,000 ops) torture mode")
     parser.add_argument("--compaction", action="store_true", help="Run compaction crash torture mode")
@@ -518,7 +527,7 @@ def main():
     args = parser.parse_args()
 
     # Resolve mode flags
-    mode = args.mode
+    mode = args.mode.replace("-", "_")
     if args.large_values:
         mode = "large_values"
     elif args.large_batches:
@@ -532,7 +541,7 @@ def main():
     elif mode == "concurrent":
         mode = "random"
 
-    broken = args.broken or (args.mode == "broken_variant") or (os.environ.get("VEDAS_BUG") in ("ack_before_fsync", "skip_commit", "apply_uncommitted"))
+    broken = args.broken or (mode == "broken_variant") or (os.environ.get("VEDAS_BUG") in ("ack_before_fsync", "skip_commit", "apply_uncommitted"))
 
     runner = TortureRunner(
         db_path=args.db,

@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$DIR/.venv/Scripts/python.exe" ]; then
+    "$DIR/.venv/Scripts/python.exe" "$DIR/vedasbase.py" "$@"
+elif [ -f "$DIR/.venv/bin/python" ]; then
+    "$DIR/.venv/bin/python" "$DIR/vedasbase.py" "$@"
+else
+    python3 "$DIR/vedasbase.py" "$@" 2>/dev/null || python "$DIR/vedasbase.py" "$@"
+fi
